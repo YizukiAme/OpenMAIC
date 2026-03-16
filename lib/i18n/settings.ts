@@ -209,7 +209,7 @@ export const settingsZhCN = {
     ttsSpeed: '语速',
     ttsBaseUrl: 'Base URL',
     ttsApiKey: 'API 密钥',
-    ttsModelId: 'Model ID（模型标识）',
+    ttsModelId: 'Model ID',
     asrProvider: 'ASR 提供商',
     asrLanguage: '识别语言',
     asrBaseUrl: 'Base URL',
