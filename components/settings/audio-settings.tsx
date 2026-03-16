@@ -20,6 +20,7 @@ import {
   getTTSVoices,
   ASR_PROVIDERS,
   getASRSupportedLanguages,
+  DEFAULT_TTS_MODELS,
 } from '@/lib/audio/constants';
 import type { TTSProviderId, ASRProviderId } from '@/lib/audio/types';
 import { Volume2, Mic, MicOff, Loader2, CheckCircle2, XCircle, Eye, EyeOff } from 'lucide-react';
@@ -112,7 +113,7 @@ export function AudioSettings({ onSave }: AudioSettingsProps = {}) {
 
   const handleTTSProviderConfigChange = (
     providerId: TTSProviderId,
-    config: Partial<{ apiKey: string; baseUrl: string; enabled: boolean }>,
+    config: Partial<{ apiKey: string; baseUrl: string; enabled: boolean; modelId: string }>,
   ) => {
     setTTSProviderConfig(providerId, config);
     onSave?.();
@@ -314,6 +315,11 @@ export function AudioSettings({ onSave }: AudioSettingsProps = {}) {
       const baseUrlValue = ttsProvidersConfig[ttsProviderId]?.baseUrl;
       if (baseUrlValue && baseUrlValue.trim()) {
         requestBody.ttsBaseUrl = baseUrlValue;
+      }
+
+      const modelIdValue = ttsProvidersConfig[ttsProviderId]?.modelId;
+      if (modelIdValue && modelIdValue.trim()) {
+        requestBody.ttsModelId = modelIdValue;
       }
 
       const response = await fetch('/api/generate/tts', {
@@ -591,6 +597,23 @@ export function AudioSettings({ onSave }: AudioSettingsProps = {}) {
                   />
                 </div>
               </div>
+
+              {/* Model ID input - only show for providers that use model ID */}
+              {DEFAULT_TTS_MODELS[ttsProviderId] && (
+                <div className="space-y-2">
+                  <Label className="text-sm">{t('settings.ttsModelId')}</Label>
+                  <Input
+                    placeholder={DEFAULT_TTS_MODELS[ttsProviderId]}
+                    value={ttsProvidersConfig[ttsProviderId]?.modelId || ''}
+                    onChange={(e) =>
+                      handleTTSProviderConfigChange(ttsProviderId, {
+                        modelId: e.target.value,
+                      })
+                    }
+                    className="text-sm"
+                  />
+                </div>
+              )}
               {(() => {
                 const effectiveBaseUrl =
                   ttsProvidersConfig[ttsProviderId]?.baseUrl || ttsProvider.defaultBaseUrl || '';

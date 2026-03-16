@@ -6,7 +6,7 @@ import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { useI18n } from '@/lib/hooks/use-i18n';
 import { useSettingsStore } from '@/lib/store/settings';
-import { TTS_PROVIDERS, DEFAULT_TTS_VOICES } from '@/lib/audio/constants';
+import { TTS_PROVIDERS, DEFAULT_TTS_VOICES, DEFAULT_TTS_MODELS } from '@/lib/audio/constants';
 import type { TTSProviderId } from '@/lib/audio/types';
 import { Volume2, Loader2, CheckCircle2, XCircle, Eye, EyeOff } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -190,6 +190,24 @@ export function TTSSettings({ selectedProviderId }: TTSSettingsProps) {
               />
             </div>
           </div>
+
+              {/* Model ID input - only show for providers that use model ID */}
+              {DEFAULT_TTS_MODELS[selectedProviderId] && (
+                <div className="space-y-2">
+                  <Label className="text-sm">{t('settings.ttsModelId')}</Label>
+                  <Input
+                    placeholder={DEFAULT_TTS_MODELS[selectedProviderId]}
+                    value={ttsProvidersConfig[selectedProviderId]?.modelId || ''}
+                    onChange={(e) =>
+                      setTTSProviderConfig(selectedProviderId, {
+                        modelId: e.target.value,
+                      })
+                    }
+                    className="text-sm"
+                  />
+                </div>
+              )}
+
           {/* Request URL Preview */}
           {(() => {
             const effectiveBaseUrl =

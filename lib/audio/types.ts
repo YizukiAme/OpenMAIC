@@ -129,6 +129,7 @@ export interface TTSModelConfig {
   voice: string;
   speed?: number;
   format?: string;
+  modelId?: string;
 }
 
 // ============================================================================
@@ -143,10 +144,8 @@ export interface TTSModelConfig {
  */
 export type ASRProviderId = 'openai-whisper' | 'browser-native' | 'qwen-asr';
 // Add new ASR providers below (uncomment and modify):
-// | 'elevenlabs-asr'
-// | 'assemblyai-asr'
-// | 'deepgram-asr'
-// | 'azure-asr'
+// | 'assemblyai'
+// | 'deepgram'
 
 /**
  * ASR Provider Configuration

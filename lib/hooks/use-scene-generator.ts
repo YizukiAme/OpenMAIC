@@ -225,6 +225,7 @@ export async function generateAndStoreTTS(
       ttsSpeed: settings.ttsSpeed,
       ttsApiKey: ttsProviderConfig?.apiKey || undefined,
       ttsBaseUrl: ttsProviderConfig?.baseUrl || undefined,
+      ttsModelId: ttsProviderConfig?.modelId || undefined,
     }),
     signal,
   });

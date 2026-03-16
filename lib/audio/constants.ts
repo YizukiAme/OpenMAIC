@@ -837,6 +837,19 @@ export const DEFAULT_TTS_VOICES: Record<TTSProviderId, string> = {
 };
 
 /**
+ * Default model ID for each TTS provider.
+ * Used as fallback when user has not configured a custom model ID.
+ * Empty string means the provider does not use a model ID parameter.
+ */
+export const DEFAULT_TTS_MODELS: Record<TTSProviderId, string> = {
+  'openai-tts': 'gpt-4o-mini-tts',
+  'azure-tts': '',
+  'glm-tts': 'glm-tts',
+  'qwen-tts': 'qwen3-tts-flash',
+  'browser-native-tts': '',
+};
+
+/**
  * Get voices for a specific TTS provider
  */
 export function getTTSVoices(providerId: TTSProviderId): TTSVoiceInfo[] {

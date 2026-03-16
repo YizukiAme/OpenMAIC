@@ -48,6 +48,7 @@ export interface SettingsState {
       apiKey: string;
       baseUrl: string;
       enabled: boolean;
+      modelId?: string;
       isServerConfigured?: boolean;
       serverBaseUrl?: string;
     }
@@ -175,7 +176,7 @@ export interface SettingsState {
   setASRLanguage: (language: string) => void;
   setTTSProviderConfig: (
     providerId: TTSProviderId,
-    config: Partial<{ apiKey: string; baseUrl: string; enabled: boolean }>,
+    config: Partial<{ apiKey: string; baseUrl: string; enabled: boolean; modelId: string }>,
   ) => void;
   setASRProviderConfig: (
     providerId: ASRProviderId,
