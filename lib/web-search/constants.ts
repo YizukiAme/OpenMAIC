@@ -22,7 +22,7 @@ export const WEB_SEARCH_PROVIDERS: Record<WebSearchProviderId, WebSearchProvider
   },
   baidu: {
     id: 'baidu',
-    name: 'Baidu AI Search',
+    name: 'Baidu',
     requiresApiKey: true,
     defaultBaseUrl: 'https://qianfan.baidubce.com',
   },
