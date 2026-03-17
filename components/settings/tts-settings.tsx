@@ -191,22 +191,22 @@ export function TTSSettings({ selectedProviderId }: TTSSettingsProps) {
             </div>
           </div>
 
-              {/* Model ID input - only show for providers that use model ID */}
-              {DEFAULT_TTS_MODELS[selectedProviderId] && (
-                <div className="space-y-2">
-                  <Label className="text-sm">{t('settings.ttsModelId')}</Label>
-                  <Input
-                    placeholder={DEFAULT_TTS_MODELS[selectedProviderId]}
-                    value={ttsProvidersConfig[selectedProviderId]?.modelId || ''}
-                    onChange={(e) =>
-                      setTTSProviderConfig(selectedProviderId, {
-                        modelId: e.target.value,
-                      })
-                    }
-                    className="text-sm"
-                  />
-                </div>
-              )}
+          {/* Model ID input - only show for providers that use model ID */}
+          {DEFAULT_TTS_MODELS[selectedProviderId] && (
+            <div className="space-y-2">
+              <Label className="text-sm">{t('settings.ttsModelId')}</Label>
+              <Input
+                placeholder={DEFAULT_TTS_MODELS[selectedProviderId]}
+                value={ttsProvidersConfig[selectedProviderId]?.modelId || ''}
+                onChange={(e) =>
+                  setTTSProviderConfig(selectedProviderId, {
+                    modelId: e.target.value,
+                  })
+                }
+                className="text-sm"
+              />
+            </div>
+          )}
 
           {/* Request URL Preview */}
           {(() => {
