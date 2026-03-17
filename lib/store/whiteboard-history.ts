@@ -79,6 +79,6 @@ export const useWhiteboardHistoryStore = create<WhiteboardHistoryState>((set, ge
     return snapshots[index] ?? null;
   },
 
-  clearHistory: () => set({ snapshots: [] }),
+  clearHistory: () => set({ snapshots: [], restoredKey: null }),
   setRestoredKey: (key) => set({ restoredKey: key }),
 }));

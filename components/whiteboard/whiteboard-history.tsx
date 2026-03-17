@@ -5,6 +5,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { RotateCcw } from 'lucide-react';
 import { useWhiteboardHistoryStore } from '@/lib/store/whiteboard-history';
 import { useStageStore } from '@/lib/store';
+import { useCanvasStore } from '@/lib/store/canvas';
 import { createStageAPI } from '@/lib/api/stage-api';
 import { elementFingerprint } from '@/lib/utils/element-fingerprint';
 import { toast } from 'sonner';
@@ -42,6 +43,13 @@ export function WhiteboardHistory({ isOpen, onClose }: WhiteboardHistoryProps) {
   }, [isOpen, onClose]);
 
   const handleRestore = (index: number) => {
+    // P1: Block restore while a clear animation is in flight — the pending
+    // delete/update would overwrite the restored content moments later.
+    if (useCanvasStore.getState().whiteboardClearing) {
+      toast.error(t('whiteboard.restoreError'));
+      return;
+    }
+
     const snapshot = useWhiteboardHistoryStore.getState().getSnapshot(index);
     if (!snapshot) return;
 
@@ -55,8 +63,18 @@ export function WhiteboardHistory({ isOpen, onClose }: WhiteboardHistoryProps) {
     }
     const whiteboardId = wbResult.data.id;
 
-    // Set restoredKey so auto-snapshot skips the incoming change
+    // P2a: Skip no-op restores — if the snapshot matches what's already
+    // on screen, applying it would not change elementsKey, leaving
+    // restoredKey armed indefinitely and suppressing a future snapshot.
     const restoredElementsKey = elementFingerprint(snapshot.elements);
+    const currentKey = elementFingerprint(wbResult.data.elements ?? []);
+    if (restoredElementsKey === currentKey) {
+      toast.success(t('whiteboard.restored'));
+      onClose();
+      return;
+    }
+
+    // Set restoredKey so auto-snapshot skips the incoming change
     useWhiteboardHistoryStore.getState().setRestoredKey(restoredElementsKey);
 
     // Transactional restore: replace all elements in one update() call
@@ -67,7 +85,8 @@ export function WhiteboardHistory({ isOpen, onClose }: WhiteboardHistoryProps) {
       // Restore failed — clear restoredKey so auto-snapshot isn't stuck
       useWhiteboardHistoryStore.getState().setRestoredKey(null);
       console.error('Failed to restore whiteboard snapshot:', result.error);
-      toast.error(t('whiteboard.clearError') + (result.error ?? ''));
+      // P3: Dedicated restoreError key (not clearError)
+      toast.error(t('whiteboard.restoreError') + (result.error ?? ''));
       return;
     }
 
