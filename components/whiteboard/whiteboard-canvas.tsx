@@ -10,9 +10,6 @@ import { elementFingerprint } from '@/lib/utils/element-fingerprint';
 import type { PPTElement } from '@/lib/types/slides';
 import { useI18n } from '@/lib/hooks/use-i18n';
 
-// elementFingerprint is imported from @/lib/utils/element-fingerprint
-// to ensure consistent fingerprinting across canvas, history, and store.
-
 /**
  * Animated element wrapper
  */
@@ -104,7 +101,6 @@ export function WhiteboardCanvas() {
   // Saves a snapshot of the CURRENT state after elements have been stable
   // (unchanged) for 2 seconds.  This ensures the complete "finished" result
   // appears in history, not just intermediate build-up states.
-  const lastSnapshotKeyRef = useRef<string>('');
   const elementsKey = useMemo(() => elementFingerprint(elements), [elements]);
   const elementsRef = useRef(elements);
   useEffect(() => {
@@ -131,15 +127,11 @@ export function WhiteboardCanvas() {
       return;
     }
 
-    // Don't snapshot if the content matches the last snapshot we took
-    if (elementsKey === lastSnapshotKeyRef.current) return;
-
     snapshotTimerRef.current = setTimeout(() => {
       // Save the CURRENT stable state (not the previous one)
       const current = elementsRef.current;
       if (current.length > 0) {
         useWhiteboardHistoryStore.getState().pushSnapshot(current);
-        lastSnapshotKeyRef.current = elementFingerprint(current);
       }
     }, 2000);
 

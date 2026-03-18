@@ -5,7 +5,7 @@ import type { PPTElement } from '@/lib/types/slides';
  * Used by elementFingerprint to detect content-only changes
  * (same id/position but different text, chart data, media src, etc.).
  */
-function semanticPart(e: PPTElement) {
+function semanticPart(e: PPTElement): unknown {
   switch (e.type) {
     case 'text':
       return { content: e.content };
@@ -45,6 +45,10 @@ function semanticPart(e: PPTElement) {
       return { src: e.src, poster: e.poster ?? '' };
     case 'audio':
       return { src: e.src };
+    default: {
+      const exhaustiveCheck: never = e;
+      return exhaustiveCheck;
+    }
   }
 }
 

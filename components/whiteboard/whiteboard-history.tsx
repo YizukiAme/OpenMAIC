@@ -24,6 +24,7 @@ interface WhiteboardHistoryProps {
 export function WhiteboardHistory({ isOpen, onClose }: WhiteboardHistoryProps) {
   const { t } = useI18n();
   const snapshots = useWhiteboardHistoryStore((s) => s.snapshots);
+  const isClearing = useCanvasStore.use.whiteboardClearing();
   const panelRef = useRef<HTMLDivElement>(null);
 
   // Close on outside click
@@ -45,7 +46,7 @@ export function WhiteboardHistory({ isOpen, onClose }: WhiteboardHistoryProps) {
   const handleRestore = (index: number) => {
     // P1: Block restore while a clear animation is in flight — the pending
     // delete/update would overwrite the restored content moments later.
-    if (useCanvasStore.getState().whiteboardClearing) {
+    if (isClearing) {
       toast.error(t('whiteboard.restoreError'));
       return;
     }
@@ -66,7 +67,7 @@ export function WhiteboardHistory({ isOpen, onClose }: WhiteboardHistoryProps) {
     // P2a: Skip no-op restores — if the snapshot matches what's already
     // on screen, applying it would not change elementsKey, leaving
     // restoredKey armed indefinitely and suppressing a future snapshot.
-    const restoredElementsKey = elementFingerprint(snapshot.elements);
+    const restoredElementsKey = snapshot.fingerprint;
     const currentKey = elementFingerprint(wbResult.data.elements ?? []);
     if (restoredElementsKey === currentKey) {
       toast.success(t('whiteboard.restored'));
@@ -150,7 +151,8 @@ export function WhiteboardHistory({ isOpen, onClose }: WhiteboardHistoryProps) {
                       <button
                         type="button"
                         onClick={() => handleRestore(realIdx)}
-                        className="ml-2 px-2 py-1 text-xs text-purple-600 dark:text-purple-400 hover:bg-purple-50 dark:hover:bg-purple-900/20 rounded-md opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1"
+                        disabled={isClearing}
+                        className="ml-2 px-2 py-1 text-xs text-purple-600 dark:text-purple-400 hover:bg-purple-50 dark:hover:bg-purple-900/20 rounded-md opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"
                       >
                         <RotateCcw className="w-3 h-3" />
                         {t('whiteboard.restore')}

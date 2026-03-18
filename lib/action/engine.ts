@@ -14,6 +14,7 @@ import { createStageAPI } from '@/lib/api/stage-api';
 import { useCanvasStore } from '@/lib/store/canvas';
 import { useWhiteboardHistoryStore } from '@/lib/store/whiteboard-history';
 import { useMediaGenerationStore, isMediaPlaceholder } from '@/lib/store/media-generation';
+import { getClientTranslation } from '@/lib/i18n';
 import type { AudioPlayer } from '@/lib/utils/audio-player';
 import type {
   Action,
@@ -500,7 +501,9 @@ export class ActionEngine {
     if (elementCount === 0) return;
 
     // Save snapshot before AI clear (mirrors UI handleClear in index.tsx)
-    useWhiteboardHistoryStore.getState().pushSnapshot(wb.data.elements!);
+    useWhiteboardHistoryStore
+      .getState()
+      .pushSnapshot(wb.data.elements!, getClientTranslation('whiteboard.beforeAIClear'));
 
     // Trigger cascade exit animation
     useCanvasStore.getState().setWhiteboardClearing(true);

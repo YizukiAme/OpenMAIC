@@ -17,8 +17,10 @@ export interface WhiteboardSnapshot {
   elements: PPTElement[];
   /** Timestamp when the snapshot was taken */
   timestamp: number;
-  /** Human-readable label, e.g. "清除前", "Step 3" */
+  /** Human-readable label shown in the history panel */
   label?: string;
+  /** Cached fingerprint used for deduplication and no-op restore checks */
+  fingerprint: string;
 }
 
 interface WhiteboardHistoryState {
@@ -49,24 +51,22 @@ export const useWhiteboardHistoryStore = create<WhiteboardHistoryState>((set, ge
     // Don't save empty snapshots
     if (!elements || elements.length === 0) return;
 
-    // Deduplication: skip if identical to the latest snapshot
-
     const { snapshots } = get();
-    if (snapshots.length > 0) {
-      const latestFp = elementFingerprint(snapshots[snapshots.length - 1].elements);
-      const newFp = elementFingerprint(elements);
-      if (latestFp === newFp) return;
+    const newFingerprint = elementFingerprint(elements);
+    if (snapshots.length > 0 && snapshots[snapshots.length - 1].fingerprint === newFingerprint) {
+      return;
     }
 
     const snapshot: WhiteboardSnapshot = {
       elements: JSON.parse(JSON.stringify(elements)), // Deep copy
       timestamp: Date.now(),
       label,
+      fingerprint: newFingerprint,
     };
 
     set((state) => {
       const newSnapshots = [...state.snapshots, snapshot];
-      // Enforce limit — drop oldest
+      // Enforce limit: drop oldest snapshots first.
       if (newSnapshots.length > state.maxSnapshots) {
         return { snapshots: newSnapshots.slice(-state.maxSnapshots) };
       }
