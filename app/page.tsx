@@ -1076,7 +1076,7 @@ function ClassroomCard({
               <Button
                 size="icon"
                 variant="ghost"
-                className="absolute top-2 right-11 size-7 opacity-0 group-hover:opacity-100 transition-opacity bg-black/30 hover:bg-white/30 text-white hover:text-white backdrop-blur-sm rounded-full"
+                className="absolute top-2 right-11 size-7 opacity-0 group-hover:opacity-100 transition-opacity bg-black/30 hover:bg-black/50 text-white hover:text-white backdrop-blur-sm rounded-full"
                 onClick={startRename}
               >
                 <Pencil className="size-3.5" />
