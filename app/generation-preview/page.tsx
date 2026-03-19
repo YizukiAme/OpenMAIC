@@ -21,6 +21,7 @@ import {
 import { getCurrentModelConfig } from '@/lib/utils/model-config';
 import { db } from '@/lib/utils/database';
 import { MAX_PDF_CONTENT_CHARS, MAX_VISION_IMAGES } from '@/lib/constants/generation';
+import { readDocxTextContent } from '@/lib/utils/document-upload';
 import { nanoid } from 'nanoid';
 import type { Stage } from '@/lib/types/stage';
 import type { SceneOutline, PdfImage, ImageMapping } from '@/lib/types/generation';
@@ -181,6 +182,24 @@ function GenerationPreviewContent() {
           pdfText = rawText.substring(0, MAX_PDF_CONTENT_CHARS);
 
           if (rawText.length > MAX_PDF_CONTENT_CHARS) {
+            warnings.push(
+              t('generation.textTruncated').replace('{n}', String(MAX_PDF_CONTENT_CHARS)),
+            );
+          }
+        } else if (currentSession.documentType === 'docx') {
+          log.debug('=== Generation Preview: Reading DOCX document ===');
+
+          let rawDocxText = '';
+          try {
+            rawDocxText = await readDocxTextContent(pdfBlob);
+          } catch (parseError) {
+            log.error('Failed to parse DOCX during generation preview:', parseError);
+            throw new Error(t('upload.docxParseFailed'));
+          }
+
+          pdfText = rawDocxText.substring(0, MAX_PDF_CONTENT_CHARS);
+
+          if (rawDocxText.length > MAX_PDF_CONTENT_CHARS) {
             warnings.push(
               t('generation.textTruncated').replace('{n}', String(MAX_PDF_CONTENT_CHARS)),
             );
