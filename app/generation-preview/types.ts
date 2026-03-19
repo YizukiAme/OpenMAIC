@@ -6,6 +6,7 @@ import type {
   PdfImage,
   ImageMapping,
 } from '@/lib/types/generation';
+import type { SupportedDocumentType } from '@/lib/utils/document-upload';
 
 // Session state stored in sessionStorage
 export interface GenerationSessionState {
@@ -20,7 +21,7 @@ export interface GenerationSessionState {
   // PDF deferred parsing fields
   pdfStorageKey?: string;
   pdfFileName?: string;
-  documentType?: 'pdf' | 'text';
+  documentType?: SupportedDocumentType;
   pdfProviderId?: string;
   pdfProviderConfig?: { apiKey?: string; baseUrl?: string };
   // Web search context

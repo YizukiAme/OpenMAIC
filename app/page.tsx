@@ -46,7 +46,12 @@ import { toast } from 'sonner';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useDraftCache } from '@/lib/hooks/use-draft-cache';
 import { SpeechButton } from '@/components/audio/speech-button';
-import { getSupportedDocumentType, readTextFileContent } from '@/lib/utils/document-upload';
+import {
+  getSupportedDocumentType,
+  readDocxTextContent,
+  readTextFileContent,
+  type SupportedDocumentType,
+} from '@/lib/utils/document-upload';
 
 const log = createLogger('Home');
 
@@ -264,7 +269,7 @@ function HomePage() {
       let pdfFileName: string | undefined;
       let pdfProviderId: string | undefined;
       let pdfProviderConfig: { apiKey?: string; baseUrl?: string } | undefined;
-      let documentType: 'pdf' | 'text' | undefined;
+      let documentType: SupportedDocumentType | undefined;
 
       if (form.pdfFile) {
         const detectedDocumentType = getSupportedDocumentType(form.pdfFile);
@@ -273,8 +278,23 @@ function HomePage() {
         }
         documentType = detectedDocumentType;
 
-        if (documentType === 'text') {
-          const content = await readTextFileContent(form.pdfFile);
+        if (documentType === 'text' || documentType === 'docx') {
+          let content = '';
+
+          try {
+            content =
+              documentType === 'text'
+                ? await readTextFileContent(form.pdfFile)
+                : await readDocxTextContent(form.pdfFile);
+          } catch (parseError) {
+            if (documentType === 'docx') {
+              log.error('Error parsing DOCX during upload validation:', parseError);
+              toast.error(t('upload.docxParseFailed'));
+              return;
+            }
+            throw parseError;
+          }
+
           if (!content.trim()) {
             toast.error(t('upload.emptyFile'));
             return;

@@ -10,18 +10,19 @@ export const generationZhCN = {
     delete: '删除',
   },
   upload: {
-    pdfSizeLimit: '支持 PDF / Markdown / TXT 文件，最大50MB',
+    pdfSizeLimit: '支持 PDF / DOCX / Markdown / TXT 文件，最大50MB',
     generateFailed: '生成课堂失败，请重试',
     requirementPlaceholder:
       '输入你想学的任何内容，例如：\n「从零学 Python，30 分钟写出第一个程序」\n「用白板给我讲解傅里叶变换」\n「阿瓦隆桌游怎么玩」',
     requirementRequired: '请输入课程需求',
     emptyFile: '文件内容为空，请选择有内容的文件',
+    docxParseFailed: 'DOCX 解析失败，请选择有效的 DOCX 文件',
     fileTooLarge: '文件过大，请选择小于50MB的文件',
   },
   generation: {
     // Progress steps (used dynamically via activeStep)
-    analyzingPdf: '解析 PDF 文档',
-    analyzingPdfDesc: '正在提取文档结构和内容...',
+    analyzingPdf: '分析文档',
+    analyzingPdfDesc: '正在提取文档内容...',
     generatingOutlines: '生成课程大纲',
     generatingOutlinesDesc: '正在构建学习路径...',
     generatingSlideContent: '生成页面内容',
@@ -75,18 +76,19 @@ export const generationEnUS = {
     delete: 'Delete',
   },
   upload: {
-    pdfSizeLimit: 'Supports PDF / Markdown / TXT files up to 50MB',
+    pdfSizeLimit: 'Supports PDF / DOCX / Markdown / TXT files up to 50MB',
     generateFailed: 'Failed to generate classroom, please try again',
     requirementPlaceholder:
       'Tell me anything you want to learn, e.g.\n"Teach me Python from scratch in 30 minutes"\n"Explain Fourier Transform on the whiteboard"\n"How to play the board game Avalon"',
     requirementRequired: 'Please enter course requirements',
     emptyFile: 'File is empty. Please select a file with content',
+    docxParseFailed: 'Failed to parse DOCX. Please select a valid DOCX file',
     fileTooLarge: 'File too large. Please select a file smaller than 50MB',
   },
   generation: {
     // Progress steps (used dynamically via activeStep)
-    analyzingPdf: 'Analyzing PDF Document',
-    analyzingPdfDesc: 'Extracting document structure and content...',
+    analyzingPdf: 'Analyzing Document',
+    analyzingPdfDesc: 'Extracting document content...',
     generatingOutlines: 'Drafting Course Outline',
     generatingOutlinesDesc: 'Structuring the learning path...',
     generatingSlideContent: 'Generating Page Content',
