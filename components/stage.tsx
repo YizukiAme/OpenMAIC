@@ -562,7 +562,9 @@ export function Stage({
       if (discussionAbortRef.current) {
         discussionAbortRef.current.abort();
       }
+      clearPresentationIdleTimer();
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- unmount-only cleanup, clearPresentationIdleTimer is stable
   }, []);
 
   // Sync mute state from settings store to audioPlayer
@@ -688,7 +690,7 @@ export function Stage({
   }, []);
 
   // play/pause toggle
-  const handlePlayPause = async () => {
+  const handlePlayPause = useCallback(async () => {
     const engine = engineRef.current;
     if (!engine) return;
 
@@ -722,7 +724,7 @@ export function Stage({
         engine.continuePlayback();
       }
     }
-  };
+  }, [playbackCompleted, currentScene]);
 
   // get scene information
   const isPendingScene = currentSceneId === PENDING_SCENE_ID;
@@ -807,6 +809,9 @@ export function Stage({
           break;
         case ' ':
         case 'Spacebar':
+          // During active QA/discussion, Roundtable owns Space for
+          // buffer-level pause/resume — don't also fire engine play/pause.
+          if (chatSessionType === 'qa' || chatSessionType === 'discussion') break;
           event.preventDefault();
           handlePlayPause();
           break;
@@ -818,6 +823,7 @@ export function Stage({
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [
+    chatSessionType,
     handleNextScene,
     handlePlayPause,
     handlePreviousScene,

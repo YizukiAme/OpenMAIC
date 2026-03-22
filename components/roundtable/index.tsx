@@ -28,6 +28,7 @@ import { PresentationSpeechOverlay } from '@/components/roundtable/presentation-
 import { AvatarDisplay } from '@/components/ui/avatar-display';
 import { HoverCard, HoverCardTrigger, HoverCardContent } from '@/components/ui/hover-card';
 import { useAgentRegistry } from '@/lib/orchestration/registry/store';
+import { DEFAULT_TEACHER_AVATAR, DEFAULT_USER_AVATAR } from '@/components/roundtable/constants';
 import type { DiscussionAction } from '@/lib/types/action';
 import type { EngineMode, PlaybackView } from '@/lib/playback';
 import type { Participant } from '@/lib/types/roundtable';
@@ -89,8 +90,7 @@ interface RoundtableProps {
   readonly onPresentationInteractionChange?: (active: boolean) => void;
 }
 
-const DEFAULT_TEACHER_AVATAR = '/avatars/teacher.png';
-const DEFAULT_USER_AVATAR = '/avatars/user.png';
+
 const VOICE_WAVE_BARS = [
   { peak: 18, duration: 0.55 },
   { peak: 24, duration: 0.72 },

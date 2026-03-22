@@ -6,9 +6,8 @@ import { AvatarDisplay } from '@/components/ui/avatar-display';
 import type { PlaybackView } from '@/lib/playback';
 import type { Participant } from '@/lib/types/roundtable';
 import { cn } from '@/lib/utils';
+import { DEFAULT_TEACHER_AVATAR, DEFAULT_STUDENT_AVATAR } from '@/components/roundtable/constants';
 
-const DEFAULT_TEACHER_AVATAR = '/avatars/teacher.png';
-const DEFAULT_STUDENT_AVATAR = '/avatars/user.png';
 const PRESENTATION_BUBBLE_WIDTH = 'w-[min(420px,calc(100vw-3rem))]';
 
 interface PresentationSpeechOverlayProps {
@@ -117,6 +116,7 @@ export function PresentationBubbleCard({ bubble }: { readonly bubble: Presentati
   const { t } = useI18n();
   return (
     <div
+      aria-live="polite"
       className={cn(
         'w-full min-w-0 rounded-3xl border backdrop-blur-xl shadow-[0_18px_50px_-20px_rgba(0,0,0,0.45)] overflow-hidden',
         bubble.role === 'user'
