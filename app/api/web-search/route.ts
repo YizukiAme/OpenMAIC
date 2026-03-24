@@ -18,10 +18,17 @@ const log = createLogger('WebSearch');
 export async function POST(req: Request) {
   try {
     const body = await req.json();
-    const { query, apiKey: clientApiKey, pdfText } = body as {
+    const { query, apiKey: clientApiKey, pdfText, modelConfig } = body as {
       query?: string;
       apiKey?: string;
       pdfText?: string;
+      modelConfig?: {
+        modelString?: string;
+        apiKey?: string;
+        baseUrl?: string;
+        providerType?: string;
+        requiresApiKey?: boolean;
+      };
     };
 
     if (!query || !query.trim()) {
@@ -38,7 +45,7 @@ export async function POST(req: Request) {
     }
 
     // Enhance query with PDF context if available
-    const effectiveQuery = await enhanceSearchQuery(query.trim(), pdfText);
+    const effectiveQuery = await enhanceSearchQuery(query.trim(), pdfText, modelConfig);
 
     const result = await searchWithTavily({ query: effectiveQuery, apiKey });
     const context = formatSearchResultsAsContext(result);

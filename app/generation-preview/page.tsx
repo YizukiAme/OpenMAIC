@@ -307,6 +307,7 @@ function GenerationPreviewContent() {
         const wsSettings = useSettingsStore.getState();
         const wsApiKey =
           wsSettings.webSearchProvidersConfig?.[wsSettings.webSearchProviderId]?.apiKey;
+        const wsModelConfig = getCurrentModelConfig();
         const res = await fetch('/api/web-search', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -314,6 +315,15 @@ function GenerationPreviewContent() {
             query: currentSession.requirements.requirement,
             apiKey: wsApiKey || undefined,
             pdfText: currentSession.pdfText || undefined,
+            modelConfig: currentSession.pdfText
+              ? {
+                  modelString: wsModelConfig.modelString,
+                  apiKey: wsModelConfig.apiKey,
+                  baseUrl: wsModelConfig.baseUrl,
+                  providerType: wsModelConfig.providerType,
+                  requiresApiKey: wsModelConfig.requiresApiKey,
+                }
+              : undefined,
           }),
           signal,
         });

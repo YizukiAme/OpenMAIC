@@ -7,7 +7,7 @@
  */
 
 import { callLLM } from '@/lib/ai/llm';
-import { resolveModel } from '@/lib/server/resolve-model';
+import { resolveModel, type ResolvedModel } from '@/lib/server/resolve-model';
 import { createLogger } from '@/lib/logger';
 
 const log = createLogger('QueryEnhancer');
@@ -21,20 +21,37 @@ const log = createLogger('QueryEnhancer');
  *
  * Returns the original query if no PDF is available or if
  * enhancement fails.
+ *
+ * @param modelConfig - Optional model config for the LLM call.
+ *   If not provided, uses server-configured default model.
  */
 export async function enhanceSearchQuery(
   query: string,
   pdfText: string | undefined,
+  modelConfig?: {
+    modelString?: string;
+    apiKey?: string;
+    baseUrl?: string;
+    providerType?: string;
+    requiresApiKey?: boolean;
+  },
 ): Promise<string> {
   if (!pdfText) return query;
 
   try {
+    let resolved: ResolvedModel;
+    try {
+      resolved = resolveModel(modelConfig || {});
+    } catch {
+      log.warn('No model available for query enhancement, using original query');
+      return query;
+    }
+
     const snippet = pdfText.slice(0, 2000);
-    const { model, modelInfo } = resolveModel({});
 
     const result = await callLLM(
       {
-        model,
+        model: resolved.model,
         messages: [
           {
             role: 'system',
@@ -51,7 +68,7 @@ Document text (first 2000 chars):
 ${snippet}`,
           },
         ],
-        maxOutputTokens: modelInfo?.outputWindow,
+        maxOutputTokens: resolved.modelInfo?.outputWindow,
       },
       'enhance-search-query',
     );
