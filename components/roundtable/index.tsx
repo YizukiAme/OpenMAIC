@@ -597,6 +597,8 @@ export function Roundtable({
           participants={initialParticipants}
           speakingAgentId={speakingAgentId ?? null}
           isTopicPending={!!isTopicPending}
+          isDiscussionPaused={!!isDiscussionPaused}
+          onPauseToggle={() => (isDiscussionPaused ? onDiscussionResume?.() : onDiscussionPause?.())}
           side="left"
         />
 
@@ -796,6 +798,8 @@ export function Roundtable({
             participants={initialParticipants}
             speakingAgentId={speakingAgentId ?? null}
             isTopicPending={!!isTopicPending}
+            isDiscussionPaused={!!isDiscussionPaused}
+            onPauseToggle={() => (isDiscussionPaused ? onDiscussionResume?.() : onDiscussionPause?.())}
             userAvatar={userAvatar}
             side="right"
           />

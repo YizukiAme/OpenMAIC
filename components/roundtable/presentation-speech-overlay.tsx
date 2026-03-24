@@ -1,6 +1,7 @@
 'use client';
 
 import { AnimatePresence, motion } from 'motion/react';
+import { Pause, Play } from 'lucide-react';
 import { useI18n } from '@/lib/hooks/use-i18n';
 import { AvatarDisplay } from '@/components/ui/avatar-display';
 import type { PlaybackView } from '@/lib/playback';
@@ -15,6 +16,8 @@ interface PresentationSpeechOverlayProps {
   readonly participants: Participant[];
   readonly speakingAgentId: string | null;
   readonly isTopicPending: boolean;
+  readonly isDiscussionPaused?: boolean;
+  readonly onPauseToggle?: () => void;
   readonly userAvatar?: string;
   /** Which side this overlay instance renders — 'left' or 'right' */
   readonly side?: 'left' | 'right';
@@ -29,6 +32,10 @@ export interface PresentationBubbleModel {
   text: string;
   isLoading: boolean;
   isTopicPending: boolean;
+  isDiscussionPaused: boolean;
+  /** True when the bubble is in an active discussion phase (show pause controls). */
+  isDiscussionActive: boolean;
+  onPauseToggle?: () => void;
 }
 
 export function buildPresentationBubbleModel({
@@ -36,6 +43,8 @@ export function buildPresentationBubbleModel({
   participants,
   speakingAgentId,
   isTopicPending,
+  isDiscussionPaused = false,
+  onPauseToggle,
   fallbackTeacherName,
   fallbackStudentName,
   fallbackUserName,
@@ -45,6 +54,8 @@ export function buildPresentationBubbleModel({
   participants: Participant[];
   speakingAgentId: string | null;
   isTopicPending: boolean;
+  isDiscussionPaused?: boolean;
+  onPauseToggle?: () => void;
   fallbackTeacherName: string;
   fallbackStudentName: string;
   fallbackUserName: string;
@@ -57,6 +68,8 @@ export function buildPresentationBubbleModel({
     phase === 'discussionActive' ||
     phase === 'discussionPaused';
   const isLoading = phase === 'discussionActive' && bubbleRole !== null && sourceText === '';
+  const isDiscussionActive =
+    phase === 'discussionActive' || phase === 'discussionPaused';
 
   if (!showDuringPhase) return null;
   if (bubbleRole !== 'teacher' && bubbleRole !== 'agent' && bubbleRole !== 'user') return null;
@@ -82,6 +95,9 @@ export function buildPresentationBubbleModel({
       text: sourceText,
       isLoading,
       isTopicPending,
+      isDiscussionPaused,
+      isDiscussionActive,
+      onPauseToggle,
     };
   }
 
@@ -96,6 +112,9 @@ export function buildPresentationBubbleModel({
       text: sourceText,
       isLoading,
       isTopicPending,
+      isDiscussionPaused,
+      isDiscussionActive,
+      onPauseToggle,
     };
   }
 
@@ -108,22 +127,52 @@ export function buildPresentationBubbleModel({
     text: sourceText,
     isLoading,
     isTopicPending,
+    isDiscussionPaused,
+    isDiscussionActive,
+    onPauseToggle,
   };
 }
 
 /** Reusable bubble card — renders the speech bubble content (avatar, name, text) */
 export function PresentationBubbleCard({ bubble }: { readonly bubble: PresentationBubbleModel }) {
   const { t } = useI18n();
+
+  const barsColor =
+    bubble.role === 'agent'
+      ? 'bg-blue-400 dark:bg-blue-500'
+      : 'bg-purple-400 dark:bg-purple-500';
+
+  // Show pause controls during active discussion when not user bubble and not loading
+  const showPauseControls =
+    bubble.isDiscussionActive &&
+    bubble.role !== 'user' &&
+    !bubble.isLoading &&
+    bubble.text;
+
   return (
     <div
       aria-live="polite"
+      role={showPauseControls ? 'button' : undefined}
+      tabIndex={showPauseControls ? 0 : undefined}
+      onClick={showPauseControls ? bubble.onPauseToggle : undefined}
+      onKeyDown={
+        showPauseControls
+          ? (e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                bubble.onPauseToggle?.();
+              }
+            }
+          : undefined
+      }
       className={cn(
-        'w-full min-w-0 rounded-3xl border backdrop-blur-xl shadow-[0_18px_50px_-20px_rgba(0,0,0,0.45)] overflow-hidden',
+        'w-full min-w-0 rounded-3xl border backdrop-blur-xl shadow-[0_18px_50px_-20px_rgba(0,0,0,0.45)] overflow-hidden relative group/pcard',
         bubble.role === 'user'
           ? 'bg-violet-50/60 dark:bg-violet-950/55 border-violet-200/70 dark:border-violet-800/60'
           : bubble.role === 'agent'
             ? 'bg-blue-50/60 dark:bg-blue-950/55 border-blue-200/70 dark:border-blue-800/60'
             : 'bg-white/62 dark:bg-gray-900/82 border-gray-200/70 dark:border-gray-700/70',
+        showPauseControls && 'cursor-pointer hover:shadow-[0_18px_60px_-18px_rgba(0,0,0,0.55)] transition-shadow',
       )}
     >
       <div className="flex items-center gap-3 px-4 pt-3 pb-2">
@@ -190,6 +239,38 @@ export function PresentationBubbleCard({ bubble }: { readonly bubble: Presentati
           </p>
         )}
       </div>
+
+      {/* Pause/play indicator — bottom-right corner */}
+      {showPauseControls && (
+        <div className="absolute right-3 bottom-3 p-1.5 rounded-full bg-gray-50/80 dark:bg-gray-700/80 group-hover/pcard:bg-purple-100 dark:group-hover/pcard:bg-purple-900/50 transition-all duration-300">
+          {bubble.isDiscussionPaused ? (
+            <Play className="w-3.5 h-3.5 text-amber-500 dark:text-amber-400 group-hover/pcard:text-purple-600 dark:group-hover/pcard:text-purple-400 ml-0.5" />
+          ) : (
+            <>
+              {/* Breathing bars — visible by default, hidden on hover */}
+              <div className="flex gap-0.5 items-end justify-center h-3.5 w-3.5 group-hover/pcard:hidden">
+                <motion.div
+                  animate={{ height: ['20%', '100%', '20%'] }}
+                  transition={{ repeat: Infinity, duration: 0.6 }}
+                  className={cn('w-1 rounded-full', barsColor)}
+                />
+                <motion.div
+                  animate={{ height: ['40%', '100%', '40%'] }}
+                  transition={{ repeat: Infinity, duration: 0.4 }}
+                  className={cn('w-1 rounded-full', barsColor)}
+                />
+                <motion.div
+                  animate={{ height: ['20%', '80%', '20%'] }}
+                  transition={{ repeat: Infinity, duration: 0.5 }}
+                  className={cn('w-1 rounded-full', barsColor)}
+                />
+              </div>
+              {/* Pause icon on hover */}
+              <Pause className="w-3.5 h-3.5 text-purple-600 dark:text-purple-400 hidden group-hover/pcard:block" />
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -199,6 +280,8 @@ export function PresentationSpeechOverlay({
   participants,
   speakingAgentId,
   isTopicPending,
+  isDiscussionPaused,
+  onPauseToggle,
   userAvatar,
   side = 'left',
 }: PresentationSpeechOverlayProps) {
@@ -208,6 +291,8 @@ export function PresentationSpeechOverlay({
     participants,
     speakingAgentId,
     isTopicPending,
+    isDiscussionPaused,
+    onPauseToggle,
     fallbackTeacherName: t('roundtable.teacher'),
     fallbackStudentName: t('settings.agentRoles.student'),
     fallbackUserName: t('roundtable.you'),
@@ -228,7 +313,7 @@ export function PresentationSpeechOverlay({
               animate={{ opacity: 1, x: 0, y: 0 }}
               exit={{ opacity: 0, y: 8 }}
               transition={{ duration: 0.22, ease: [0.21, 1, 0.36, 1] }}
-              className={cn('absolute bottom-6 left-6 z-30', PRESENTATION_BUBBLE_WIDTH)}
+              className={cn('absolute bottom-6 left-6 z-30 pointer-events-auto', PRESENTATION_BUBBLE_WIDTH)}
             >
               <PresentationBubbleCard bubble={bubble} />
             </motion.div>
@@ -248,7 +333,7 @@ export function PresentationSpeechOverlay({
           animate={{ opacity: 1, x: 0, y: 0 }}
           exit={{ opacity: 0, y: 8 }}
           transition={{ duration: 0.22, ease: [0.21, 1, 0.36, 1] }}
-          className={PRESENTATION_BUBBLE_WIDTH}
+          className={cn(PRESENTATION_BUBBLE_WIDTH, 'pointer-events-auto')}
         >
           <PresentationBubbleCard bubble={bubble} />
         </motion.div>
