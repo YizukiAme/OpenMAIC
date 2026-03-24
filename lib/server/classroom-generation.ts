@@ -108,6 +108,50 @@ function stripCodeFences(text: string): string {
   return cleaned.trim();
 }
 
+/**
+ * When a PDF is uploaded but the user requirement is too vague to be a useful
+ * search query (e.g. "讲讲这篇论文"), use a lightweight LLM call to extract
+ * meaningful keywords from the PDF text.
+ *
+ * Returns the original requirement if no enhancement is needed or if
+ * enhancement fails.
+ */
+async function enhanceSearchQuery(
+  requirement: string,
+  pdfText: string | undefined,
+  aiCall: AICallFn,
+): Promise<string> {
+  // No PDF → requirement is the only context we have
+  if (!pdfText) return requirement;
+
+  // If requirement is already long enough (> 30 chars), it's probably specific
+  // enough to be a decent search query on its own
+  if (requirement.length > 30) return requirement;
+
+  try {
+    const snippet = pdfText.slice(0, 2000);
+    const result = await aiCall(
+      'You extract search keywords from academic documents. Return ONLY a concise search query string (under 200 characters), no explanation.',
+      `The user uploaded a document and said: "${requirement}"
+
+Extract the document's title, key topics, and important terms from the text below, then combine them into a concise web search query (under 200 characters) that would find relevant supplementary materials.
+
+Document text (first 2000 chars):
+${snippet}`,
+    );
+
+    const enhanced = result.trim();
+    if (enhanced && enhanced.length > 5 && enhanced.length <= 400) {
+      log.info(`Enhanced search query: "${requirement}" → "${enhanced}"`);
+      return enhanced;
+    }
+  } catch (e) {
+    log.warn('Search query enhancement failed, using original requirement:', e);
+  }
+
+  return requirement;
+}
+
 async function generateAgentProfiles(
   requirement: string,
   language: string,
@@ -241,7 +285,8 @@ export async function generateClassroom(
     if (tavilyKey) {
       try {
         log.info('Running web search for requirement context...');
-        const searchResult = await searchWithTavily({ query: requirement, apiKey: tavilyKey });
+        const searchQuery = await enhanceSearchQuery(requirement, pdfText, aiCall);
+        const searchResult = await searchWithTavily({ query: searchQuery, apiKey: tavilyKey });
         researchContext = formatSearchResultsAsContext(searchResult);
         if (researchContext) {
           log.info(`Web search returned ${searchResult.sources.length} sources`);
