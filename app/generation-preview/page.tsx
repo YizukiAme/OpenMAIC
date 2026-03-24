@@ -313,6 +313,7 @@ function GenerationPreviewContent() {
           body: JSON.stringify({
             query: currentSession.requirements.requirement,
             apiKey: wsApiKey || undefined,
+            pdfText: currentSession.pdfText || undefined,
           }),
           signal,
         });
