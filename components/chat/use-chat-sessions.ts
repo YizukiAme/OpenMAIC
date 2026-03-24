@@ -36,6 +36,14 @@ interface UseChatSessionsOptions {
   onActiveBubble?: (messageId: string | null) => void;
   /** Called when a QA/Discussion session completes naturally (director end). */
   onStopSession?: () => void;
+  onSegmentSealed?: (
+    messageId: string,
+    partId: string,
+    fullText: string,
+    agentId: string | null,
+  ) => void;
+  /** When provided and returns true, StreamBuffer holds on the current text item after reveal. */
+  shouldHoldAfterReveal?: () => boolean;
 }
 
 export function useChatSessions(options: UseChatSessionsOptions = {}) {
@@ -45,6 +53,8 @@ export function useChatSessions(options: UseChatSessionsOptions = {}) {
   const onCueUserRef = useRef(options.onCueUser);
   const onActiveBubbleRef = useRef(options.onActiveBubble);
   const onStopSessionRef = useRef(options.onStopSession);
+  const onSegmentSealedRef = useRef(options.onSegmentSealed);
+  const shouldHoldAfterRevealRef = useRef(options.shouldHoldAfterReveal);
   useEffect(() => {
     onLiveSpeechRef.current = options.onLiveSpeech;
     onSpeechProgressRef.current = options.onSpeechProgress;
@@ -52,6 +62,8 @@ export function useChatSessions(options: UseChatSessionsOptions = {}) {
     onCueUserRef.current = options.onCueUser;
     onActiveBubbleRef.current = options.onActiveBubble;
     onStopSessionRef.current = options.onStopSession;
+    onSegmentSealedRef.current = options.onSegmentSealed;
+    shouldHoldAfterRevealRef.current = options.shouldHoldAfterReveal;
   }, [
     options.onLiveSpeech,
     options.onSpeechProgress,
@@ -59,6 +71,8 @@ export function useChatSessions(options: UseChatSessionsOptions = {}) {
     options.onCueUser,
     options.onActiveBubble,
     options.onStopSession,
+    options.onSegmentSealed,
+    options.shouldHoldAfterReveal,
   ]);
   const { t } = useI18n();
 
@@ -321,6 +335,19 @@ export function useChatSessions(options: UseChatSessionsOptions = {}) {
           onError(message: string) {
             log.error('[Buffer] Stream error:', message);
           },
+
+          onSegmentSealed(
+            messageId: string,
+            partId: string,
+            fullText: string,
+            agentId: string | null,
+          ) {
+            onSegmentSealedRef.current?.(messageId, partId, fullText, agentId);
+          },
+
+          shouldHoldAfterReveal() {
+            return shouldHoldAfterRevealRef.current?.() ?? false;
+          },
         },
         pacingOptions,
       );
@@ -364,6 +391,8 @@ export function useChatSessions(options: UseChatSessionsOptions = {}) {
         apiKey: string;
         baseUrl?: string;
         model?: string;
+        providerType?: string;
+        requiresApiKey?: boolean;
       },
       controller: AbortController,
       sessionType: SessionType,
@@ -784,6 +813,8 @@ export function useChatSessions(options: UseChatSessionsOptions = {}) {
             apiKey: mc.apiKey,
             baseUrl: mc.baseUrl,
             model: mc.modelString,
+            providerType: mc.providerType,
+            requiresApiKey: mc.requiresApiKey,
           },
           controller,
           session.type,
@@ -1019,6 +1050,8 @@ export function useChatSessions(options: UseChatSessionsOptions = {}) {
             apiKey: mc.apiKey,
             baseUrl: mc.baseUrl,
             model: mc.modelString,
+            providerType: mc.providerType,
+            requiresApiKey: mc.requiresApiKey,
           },
           controller,
           sessionType,
@@ -1178,6 +1211,8 @@ export function useChatSessions(options: UseChatSessionsOptions = {}) {
             apiKey: mc.apiKey,
             baseUrl: mc.baseUrl,
             model: mc.modelString,
+            providerType: mc.providerType,
+            requiresApiKey: mc.requiresApiKey,
           },
           controller,
           'discussion',
