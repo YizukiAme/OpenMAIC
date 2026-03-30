@@ -31,6 +31,36 @@ import type { Scene, Stage } from '@/lib/types/stage';
 
 const log = createLogger('Classroom');
 
+/** Color palette for generated agents (consistent with /api/generate/agent-profiles) */
+const AGENT_COLORS = [
+  '#3b82f6',
+  '#10b981',
+  '#f59e0b',
+  '#ec4899',
+  '#06b6d4',
+  '#8b5cf6',
+  '#f97316',
+  '#14b8a6',
+  '#e11d48',
+  '#6366f1',
+  '#84cc16',
+  '#a855f7',
+];
+
+/** Default avatars cycled for generated agents */
+const AGENT_AVATARS = [
+  '/avatars/teacher.png',
+  '/avatars/student.png',
+  '/avatars/assistant.png',
+  '/avatars/curious.png',
+  '/avatars/thinker.png',
+  '/avatars/student-2.png',
+  '/avatars/teacher-2.png',
+  '/avatars/assistant-2.png',
+  '/avatars/curious-2.png',
+  '/avatars/thinker-2.png',
+];
+
 export interface GenerateClassroomInput {
   requirement: string;
   pdfContent?: { text: string; images: string[] };
@@ -300,6 +330,17 @@ export async function generateClassroom(
     style: 'interactive',
     createdAt: Date.now(),
     updatedAt: Date.now(),
+    // Embed agent configs so API-generated classrooms can hydrate
+    // the client-side agent registry without IndexedDB
+    generatedAgentConfigs: agents.map((a, i) => ({
+      id: a.id,
+      name: a.name,
+      role: a.role,
+      persona: a.persona || '',
+      avatar: AGENT_AVATARS[i % AGENT_AVATARS.length],
+      color: AGENT_COLORS[i % AGENT_COLORS.length],
+      priority: a.role === 'teacher' ? 10 : a.role === 'assistant' ? 7 : 5,
+    })),
   };
 
   const store = createInMemoryStore(stage);
