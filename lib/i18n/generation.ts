@@ -10,6 +10,7 @@ export const generationZhCN = {
     delete: '删除',
     rename: '重命名',
     renamePlaceholder: '输入课堂名称',
+    renameFailed: '重命名失败',
   },
   upload: {
     pdfSizeLimit: '支持最大50MB的PDF文件',
@@ -79,6 +80,7 @@ export const generationEnUS = {
     delete: 'Delete',
     rename: 'Rename',
     renamePlaceholder: 'Enter classroom name',
+    renameFailed: 'Failed to rename classroom',
   },
   upload: {
     pdfSizeLimit: 'Supports PDF files up to 50MB',

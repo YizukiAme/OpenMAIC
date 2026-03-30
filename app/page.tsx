@@ -193,7 +193,7 @@ function HomePage() {
       setClassrooms((prev) => prev.map((c) => (c.id === id ? { ...c, name: newName } : c)));
     } catch (err) {
       log.error('Failed to rename classroom:', err);
-      toast.error('Failed to rename classroom');
+      toast.error(t('classroom.renameFailed'));
     }
   };
 
@@ -1016,14 +1016,18 @@ function ClassroomCard({
     return () => ro.disconnect();
   }, []);
 
+  useEffect(() => {
+    if (editing) nameInputRef.current?.focus();
+  }, [editing]);
+
   const startRename = (e: React.MouseEvent) => {
     e.stopPropagation();
     setNameDraft(classroom.name);
     setEditing(true);
-    setTimeout(() => nameInputRef.current?.focus(), 50);
   };
 
   const commitRename = () => {
+    if (!editing) return;
     const trimmed = nameDraft.trim();
     if (trimmed && trimmed !== classroom.name) {
       onRename(classroom.id, trimmed);
@@ -1123,53 +1127,53 @@ function ClassroomCard({
         <span className="shrink-0 inline-flex items-center rounded-full bg-violet-100 dark:bg-violet-900/30 px-2 py-0.5 text-[11px] font-medium text-violet-600 dark:text-violet-400">
           {classroom.sceneCount} {t('classroom.slides')} · {formatDate(classroom.updatedAt)}
         </span>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            {editing ? (
-              <div className="flex-1 min-w-0" onClick={(e) => e.stopPropagation()}>
-                <input
-                  ref={nameInputRef}
-                  value={nameDraft}
-                  onChange={(e) => setNameDraft(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') commitRename();
-                    if (e.key === 'Escape') setEditing(false);
-                  }}
-                  onBlur={commitRename}
-                  maxLength={100}
-                  placeholder={t('classroom.renamePlaceholder')}
-                  className="w-full bg-transparent border-b border-violet-400/60 text-[15px] font-medium text-foreground/90 outline-none placeholder:text-muted-foreground/40"
-                />
-              </div>
-            ) : (
+        {editing ? (
+          <div className="flex-1 min-w-0" onClick={(e) => e.stopPropagation()}>
+            <input
+              ref={nameInputRef}
+              value={nameDraft}
+              onChange={(e) => setNameDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') commitRename();
+                if (e.key === 'Escape') setEditing(false);
+              }}
+              onBlur={commitRename}
+              maxLength={100}
+              placeholder={t('classroom.renamePlaceholder')}
+              className="w-full bg-transparent border-b border-violet-400/60 text-[15px] font-medium text-foreground/90 outline-none placeholder:text-muted-foreground/40"
+            />
+          </div>
+        ) : (
+          <Tooltip>
+            <TooltipTrigger asChild>
               <p
                 className="font-medium text-[15px] truncate text-foreground/90 min-w-0 cursor-text"
                 onDoubleClick={startRename}
               >
                 {classroom.name}
               </p>
-            )}
-          </TooltipTrigger>
-          <TooltipContent
-            side="bottom"
-            sideOffset={4}
-            className="!max-w-[min(90vw,32rem)] break-words whitespace-normal"
-          >
-            <div className="flex items-center gap-1.5">
-              <span className="break-all">{classroom.name}</span>
-              <button
-                className="shrink-0 p-0.5 rounded hover:bg-foreground/10 transition-colors"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  navigator.clipboard.writeText(classroom.name);
-                  toast.success(t('classroom.nameCopied'));
-                }}
-              >
-                <Copy className="size-3 opacity-60" />
-              </button>
-            </div>
-          </TooltipContent>
-        </Tooltip>
+            </TooltipTrigger>
+            <TooltipContent
+              side="bottom"
+              sideOffset={4}
+              className="!max-w-[min(90vw,32rem)] break-words whitespace-normal"
+            >
+              <div className="flex items-center gap-1.5">
+                <span className="break-all">{classroom.name}</span>
+                <button
+                  className="shrink-0 p-0.5 rounded hover:bg-foreground/10 transition-colors"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    navigator.clipboard.writeText(classroom.name);
+                    toast.success(t('classroom.nameCopied'));
+                  }}
+                >
+                  <Copy className="size-3 opacity-60" />
+                </button>
+              </div>
+            </TooltipContent>
+          </Tooltip>
+        )}
       </div>
     </div>
   );
