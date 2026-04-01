@@ -50,8 +50,6 @@ function stripCodeFences(text: string): string {
 }
 
 export async function POST(req: NextRequest) {
-  let stageName: string | undefined;
-  let modelString: string | undefined;
   try {
     const body = (await req.json()) as RequestBody;
     const {
@@ -62,7 +60,6 @@ export async function POST(req: NextRequest) {
       avatarDescriptions,
       availableVoices,
     } = body;
-    stageName = stageInfo?.name;
 
     // ── Validate required fields ──
     if (!stageInfo?.name) {
@@ -80,8 +77,7 @@ export async function POST(req: NextRequest) {
     }
 
     // ── Model resolution from request headers ──
-    const { model: languageModel, modelString: _modelString } = resolveModelFromHeaders(req);
-    modelString = _modelString;
+    const { model: languageModel, modelString } = resolveModelFromHeaders(req);
 
     // ── Build prompt ──
     const sceneSummary = sceneOutlines?.length
@@ -226,10 +222,7 @@ Return a JSON object with this exact structure:
 
     return apiSuccess({ agents });
   } catch (error) {
-    log.error(
-      `Agent profiles generation failed [stage="${stageName ?? 'unknown'}", model=${modelString ?? 'unknown'}]:`,
-      error,
-    );
+    log.error('Agent profiles generation error:', error);
     return apiError('INTERNAL_ERROR', 500, error instanceof Error ? error.message : String(error));
   }
 }

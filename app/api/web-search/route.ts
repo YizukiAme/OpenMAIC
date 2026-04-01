@@ -13,14 +13,12 @@ import { apiError, apiSuccess } from '@/lib/server/api-response';
 const log = createLogger('WebSearch');
 
 export async function POST(req: Request) {
-  let query: string | undefined;
   try {
     const body = await req.json();
-    const { apiKey: clientApiKey } = body as {
+    const { query, apiKey: clientApiKey } = body as {
       query?: string;
       apiKey?: string;
     };
-    query = body.query;
 
     if (!query || !query.trim()) {
       return apiError('MISSING_REQUIRED_FIELD', 400, 'query is required');
@@ -46,7 +44,7 @@ export async function POST(req: Request) {
       responseTime: result.responseTime,
     });
   } catch (err) {
-    log.error(`Web search failed [query="${query?.substring(0, 60) ?? 'unknown'}"]:`, err);
+    log.error('[WebSearch] Error:', err);
     const message = err instanceof Error ? err.message : 'Web search failed';
     return apiError('INTERNAL_ERROR', 500, message);
   }

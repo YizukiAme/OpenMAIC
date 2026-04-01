@@ -20,24 +20,19 @@ const log = createLogger('TTS API');
 export const maxDuration = 30;
 
 export async function POST(req: NextRequest) {
-  let ttsProviderId: string | undefined;
-  let ttsVoice: string | undefined;
-  let audioId: string | undefined;
   try {
     const body = await req.json();
-    const { text, ttsModelId, ttsSpeed, ttsApiKey, ttsBaseUrl } = body as {
-      text: string;
-      audioId: string;
-      ttsProviderId: TTSProviderId;
-      ttsModelId?: string;
-      ttsVoice: string;
-      ttsSpeed?: number;
-      ttsApiKey?: string;
-      ttsBaseUrl?: string;
-    };
-    ttsProviderId = body.ttsProviderId;
-    ttsVoice = body.ttsVoice;
-    audioId = body.audioId;
+    const { text, audioId, ttsProviderId, ttsModelId, ttsVoice, ttsSpeed, ttsApiKey, ttsBaseUrl } =
+      body as {
+        text: string;
+        audioId: string;
+        ttsProviderId: TTSProviderId;
+        ttsModelId?: string;
+        ttsVoice: string;
+        ttsSpeed?: number;
+        ttsApiKey?: string;
+        ttsBaseUrl?: string;
+      };
 
     // Validate required fields
     if (!text || !audioId || !ttsProviderId || !ttsVoice) {
@@ -70,7 +65,7 @@ export async function POST(req: NextRequest) {
 
     // Build TTS config
     const config = {
-      providerId: ttsProviderId as TTSProviderId,
+      providerId: ttsProviderId,
       modelId: ttsModelId,
       voice: ttsVoice,
       speed: ttsSpeed ?? 1.0,
@@ -90,10 +85,7 @@ export async function POST(req: NextRequest) {
 
     return apiSuccess({ audioId, base64, format });
   } catch (error) {
-    log.error(
-      `TTS generation failed [provider=${ttsProviderId ?? 'unknown'}, voice=${ttsVoice ?? 'unknown'}, audioId=${audioId ?? 'unknown'}]:`,
-      error,
-    );
+    log.error('TTS generation error:', error);
     return apiError(
       'GENERATION_FAILED',
       500,

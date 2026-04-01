@@ -42,13 +42,9 @@ export const maxDuration = 60;
  */
 export async function POST(req: NextRequest) {
   const encoder = new TextEncoder();
-  let chatModel: string | undefined;
-  let chatMessageCount: number | undefined;
 
   try {
     const body: StatelessChatRequest = await req.json();
-    chatModel = body.model;
-    chatMessageCount = body.messages?.length;
 
     // Validate required fields
     if (!body.messages || !Array.isArray(body.messages)) {
@@ -149,10 +145,7 @@ export async function POST(req: NextRequest) {
           return;
         }
 
-        log.error(
-          `Chat stream error [model=${body.model ?? 'unknown'}, agents=${body.config?.agentIds?.length ?? 0}, messages=${body.messages?.length ?? 0}]:`,
-          error,
-        );
+        log.error('Stream error:', error);
 
         // Try to send error event
         try {
@@ -178,10 +171,7 @@ export async function POST(req: NextRequest) {
       },
     });
   } catch (error) {
-    log.error(
-      `Chat request failed [model=${chatModel ?? 'unknown'}, messages=${chatMessageCount ?? 0}]:`,
-      error,
-    );
+    log.error('Error:', error);
     return apiError(
       'INTERNAL_ERROR',
       500,
