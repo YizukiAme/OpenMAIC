@@ -971,6 +971,7 @@
     "baiduSubSourceBaikeDescription": "مقالات موسوعية من Baidu Baike.",
     "baiduSubSourceScholar": "Baidu Scholar",
     "baiduSubSourceScholarDescription": "أبحاث أكاديمية من Baidu Scholar.",
+    "viewDocs": "مستندات API",
     "webSearchBaseUrl": "العنوان الأساسي",
     "webSearchServerConfigured": "تم تكوين مفتاح API للبحث على الخادم",
     "optional": "اختياري"
