@@ -1,7 +1,12 @@
 import { Pool } from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
-import { ensureAgentSessionSchema } from '../../packages/@openmaic/storage/src/agent-session/pg';
+import { Session } from '@earendil-works/pi-agent-core';
+
+import {
+  PgAgentSessionStore,
+  ensureAgentSessionSchema,
+} from '../../packages/@openmaic/storage/src/agent-session/pg';
 import { ensureAssetSchema } from '../../packages/@openmaic/storage/src/asset/pg';
 import {
   ensureDocumentSchema,
@@ -10,6 +15,7 @@ import {
 } from '../../packages/@openmaic/storage/src/document/pg';
 import { assetPrincipalForOwner } from '@/lib/persistence/owner-assets';
 import { ensureStageMetaSchema } from '@/lib/persistence/stage-meta';
+import { AgentSessionEntryStorage } from '@/lib/server/agent-runtime/entry-tree-storage';
 import {
   applyBranchRequests,
   readPendingBranchRequests,
@@ -37,6 +43,13 @@ import {
 const contractUrl = process.env.PG_CONTRACT_URL;
 const TEST_SCHEMA = `openmaic_course_versions_${process.pid}`;
 const OWNER = 'owner-1';
+const base = [
+  { id: 'p1', title: 'What it is' },
+  { id: 'p2', title: 'Light reactions' },
+  { id: 'p3', title: 'Calvin cycle' },
+];
+const withExtra = (pageId: string, extra: string) =>
+  base.map((page) => (page.id === pageId ? { ...page, extra } : page));
 const STAGE = 'stage-photosynthesis';
 const STAGE_B = 'stage-respiration';
 
@@ -95,7 +108,12 @@ describe.skipIf(!contractUrl)('course versions (#1317 prototype)', () => {
     it('has nothing to record for a course that does not exist yet', async () => {
       const documents = new MemoryDocuments();
       expect(
-        await snapshotCourse(db, { ownerId: OWNER, stageId: STAGE, origin: 'before_run', documents }),
+        await snapshotCourse(db, {
+          ownerId: OWNER,
+          stageId: STAGE,
+          origin: 'before_run',
+          documents,
+        }),
       ).toBeNull();
     });
 
@@ -150,7 +168,12 @@ describe.skipIf(!contractUrl)('course versions (#1317 prototype)', () => {
         origin: 'after_run',
         documents,
       });
-      await documents.saveDocument(course(STAGE, [{ id: 'p1', title: 'After' }, { id: 'p2', title: 'New' }]));
+      await documents.saveDocument(
+        course(STAGE, [
+          { id: 'p1', title: 'After' },
+          { id: 'p2', title: 'New' },
+        ]),
+      );
 
       expect(
         await checkoutCourseVersion(db, { versionId: before!.id, stageId: STAGE, documents }),
@@ -215,14 +238,6 @@ describe.skipIf(!contractUrl)('course versions (#1317 prototype)', () => {
       return { deps, session, storage };
     }
 
-    const base = [
-      { id: 'p1', title: 'What it is' },
-      { id: 'p2', title: 'Light reactions' },
-      { id: 'p3', title: 'Calvin cycle' },
-    ];
-    const withExtra = (pageId: string, extra: string) =>
-      base.map((page) => (page.id === pageId ? { ...page, extra } : page));
-
     it('records a version only when a course changed', async () => {
       const documents = new MemoryDocuments();
       await documents.saveDocument(course(STAGE, base));
@@ -230,7 +245,9 @@ describe.skipIf(!contractUrl)('course versions (#1317 prototype)', () => {
       await recordCourseVersions(deps, { phase: 'after_run' });
       await recordCourseVersions(deps, { phase: 'before_run' });
       const marks = storage.entries.filter(
-        (entry) => entry.type === 'custom' && (entry as { customType?: string }).customType === COURSE_VERSIONS_ENTRY,
+        (entry) =>
+          entry.type === 'custom' &&
+          (entry as { customType?: string }).customType === COURSE_VERSIONS_ENTRY,
       );
       expect(marks).toHaveLength(1);
     });
@@ -252,9 +269,12 @@ describe.skipIf(!contractUrl)('course versions (#1317 prototype)', () => {
       await appendUser(session, 'add an experiment video to page 2', 7);
       await appendAssistant(session, 'added a video');
       await documents.saveDocument(
-        course(STAGE, withExtra('p1', 'hand-edited title').map((page) =>
-          page.id === 'p2' ? { ...page, extra: 'video' } : page,
-        )),
+        course(
+          STAGE,
+          withExtra('p1', 'hand-edited title').map((page) =>
+            page.id === 'p2' ? { ...page, extra: 'video' } : page,
+          ),
+        ),
       );
       await recordCourseVersions(deps, { phase: 'after_run', status: 'succeeded' });
       expect(titles(await documents.loadDocument(STAGE))).toEqual([
@@ -277,14 +297,21 @@ describe.skipIf(!contractUrl)('course versions (#1317 prototype)', () => {
       ]);
       const leaf = await session.getLeafId();
       const marker = storage.entries.find((entry) => entry.id === leaf)!;
-      expect(marker).toMatchObject({ type: 'custom', customType: REPLY_VARIANT_ENTRY, data: { requestSeq: 20 } });
+      expect(marker).toMatchObject({
+        type: 'custom',
+        customType: REPLY_VARIANT_ENTRY,
+        data: { requestSeq: 20 },
+      });
 
       // The new reply builds an animation instead.
       await appendAssistant(session, 'added an animation');
       await documents.saveDocument(
-        course(STAGE, withExtra('p1', 'hand-edited title').map((page) =>
-          page.id === 'p2' ? { ...page, extra: 'animation' } : page,
-        )),
+        course(
+          STAGE,
+          withExtra('p1', 'hand-edited title').map((page) =>
+            page.id === 'p2' ? { ...page, extra: 'animation' } : page,
+          ),
+        ),
       );
       await recordCourseVersions(deps, { phase: 'after_run', status: 'succeeded' });
 
@@ -300,17 +327,28 @@ describe.skipIf(!contractUrl)('course versions (#1317 prototype)', () => {
 
       // A hand edit on this branch survives switching away and back.
       await documents.saveDocument(
-        course(STAGE, withExtra('p1', 'hand-edited title').map((page) =>
-          page.id === 'p2' ? { ...page, extra: 'video' } : page.id === 'p3' ? { ...page, extra: 'note' } : page,
-        )),
+        course(
+          STAGE,
+          withExtra('p1', 'hand-edited title').map((page) =>
+            page.id === 'p2'
+              ? { ...page, extra: 'video' }
+              : page.id === 'p3'
+                ? { ...page, extra: 'note' }
+                : page,
+          ),
+        ),
       );
-      await applyBranchRequests(deps, [{ seq: 26, data: { op: 'switch', targetSeq: 7, variant: 20 } }]);
+      await applyBranchRequests(deps, [
+        { seq: 26, data: { op: 'switch', targetSeq: 7, variant: 20 } },
+      ]);
       expect(titles(await documents.loadDocument(STAGE))).toEqual([
         'What it is+hand-edited title',
         'Light reactions+animation',
         'Calvin cycle',
       ]);
-      await applyBranchRequests(deps, [{ seq: 27, data: { op: 'switch', targetSeq: 7, variant: 'orig' } }]);
+      await applyBranchRequests(deps, [
+        { seq: 27, data: { op: 'switch', targetSeq: 7, variant: 'orig' } },
+      ]);
       expect(titles(await documents.loadDocument(STAGE))).toEqual([
         'What it is+hand-edited title',
         'Light reactions+video',
@@ -318,7 +356,9 @@ describe.skipIf(!contractUrl)('course versions (#1317 prototype)', () => {
       ]);
 
       // Edit ③: the conversation goes to just before it, and so does the course.
-      const edited = await applyBranchRequests(deps, [{ seq: 30, data: { op: 'edit', targetSeq: 7 } }]);
+      const edited = await applyBranchRequests(deps, [
+        { seq: 30, data: { op: 'edit', targetSeq: 7 } },
+      ]);
       expect(edited.outcomes).toMatchObject([{ requestSeq: 30, op: 'edit', status: 'applied' }]);
       expect(titles(await documents.loadDocument(STAGE))).toEqual([
         'What it is+hand-edited title',
@@ -446,13 +486,80 @@ describe.skipIf(!contractUrl)('course versions (#1317 prototype)', () => {
       const { deps, session } = depsFor(documents);
       await appendUser(session, 'first', 3);
       await appendAssistant(session, 'done');
-      const result = await applyBranchRequests(
-        { ...deps, hasPendingMedia: () => true },
-        [{ seq: 9, data: { op: 'regenerate', targetSeq: 3 } }],
-      );
+      const result = await applyBranchRequests({ ...deps, hasPendingMedia: () => true }, [
+        { seq: 9, data: { op: 'regenerate', targetSeq: 3 } },
+      ]);
       expect(result.outcomes).toEqual([
         { requestSeq: 9, op: 'regenerate', status: 'rejected', reason: 'media_pending' },
       ]);
+    });
+  });
+
+  describe('on the PostgreSQL entry tree, under a lease', () => {
+    it('keeps the branch and its course together across regenerate and switch', async () => {
+      await pool.query(
+        'TRUNCATE agent_session_entries, agent_session_events, agent_sessions CASCADE',
+      );
+      const store = new PgAgentSessionStore(pool as unknown as Queryable, {
+        withTransaction: transactionFor(pool),
+      });
+      await store.createSession({ id: 'tree-1', ownerId: OWNER, prompt: 'lesson', stageId: STAGE });
+      const claim = await store.claimNextSession('worker-1', 1, {
+        leaseTtlMs: 60_000,
+        maxAttempts: 5,
+        sessionId: 'tree-1',
+      });
+      expect(claim?.id).toBe('tree-1');
+      const handle = await store.openEntryTree('tree-1', 'worker-1', claim!.attempt);
+      const session = new Session(
+        AgentSessionEntryStorage.fromHandle({ id: 'tree-1', createdAt: Date.now() }, handle),
+      );
+      const documents = new MemoryDocuments();
+      await documents.saveDocument(course(STAGE, base));
+      const deps = {
+        sessionId: 'tree-1',
+        ownerId: OWNER,
+        defaultStageId: STAGE,
+        session,
+        writeEntry: (write: () => Promise<void>) => write(),
+        documents,
+        db,
+        hasPendingMedia: () => false,
+      };
+
+      await appendUser(session, 'lesson');
+      await appendAssistant(session, 'three pages');
+      await recordCourseVersions(deps, { phase: 'after_run' });
+      await recordCourseVersions(deps, { phase: 'before_run' });
+      await appendUser(session, 'add a video', 5);
+      await appendAssistant(session, 'video added');
+      await documents.saveDocument(course(STAGE, withExtra('p2', 'video')));
+      await recordCourseVersions(deps, { phase: 'after_run' });
+
+      await applyBranchRequests(deps, [{ seq: 8, data: { op: 'regenerate', targetSeq: 5 } }]);
+      expect(titles(await documents.loadDocument(STAGE))[1]).toBe('Light reactions');
+      await appendAssistant(session, 'animation added');
+      await documents.saveDocument(course(STAGE, withExtra('p2', 'animation')));
+      await recordCourseVersions(deps, { phase: 'after_run' });
+
+      await applyBranchRequests(deps, [
+        { seq: 9, data: { op: 'switch', targetSeq: 5, variant: 'orig' } },
+      ]);
+      expect(titles(await documents.loadDocument(STAGE))[1]).toBe('Light reactions+video');
+      // The model's context on this branch is the original exchange only.
+      const context = await session.buildContext();
+      expect(
+        context.messages.map((message) =>
+          message.role === 'user'
+            ? String((message as { content: unknown }).content)
+            : ((message as { content: Array<{ text?: string }> }).content[0]?.text ?? ''),
+        ),
+      ).toEqual(['lesson', 'three pages', 'add a video', 'video added']);
+
+      // A fresh handle (a later claim) reads the same branch back.
+      const reopened = await store.openEntryTree('tree-1', 'worker-1', claim!.attempt);
+      const path = await reopened.getPathToRoot(await reopened.getLeafId());
+      expect(path.at(-1)?.type).toBe('custom');
     });
   });
 

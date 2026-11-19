@@ -7,8 +7,6 @@ import { NextResponse } from 'next/server';
 
 import { isAgentRuntimeConfigured } from '@/lib/config/feature-flags';
 import { apiError } from '@/lib/server/api-response';
-import { supportedLocaleOf } from '@/lib/i18n/types';
-import { MAX_SESSION_TEXT_LENGTH } from '@/lib/server/agent-runtime/limits';
 import { getAgentSessionStore } from '@/lib/server/agent-runtime/store';
 import { scheduleConversationTitle } from '@/lib/server/agent-runtime/conversation-title-task';
 import { withRequestOwner } from '@/lib/server/identity/with-owner';
@@ -16,8 +14,10 @@ import {
   ownerRetiredResponseIfRetired,
   ownerWriteErrorResponse,
 } from '@/lib/persistence/owner-merges';
-import { decodeElementRefs } from '@/lib/workbench/element-refs';
-import { decodeCourseRefs } from '@/lib/workbench/course-refs';
+import {
+  parseUserMessageInput,
+  type UserMessageBody,
+} from '@/lib/server/agent-runtime/user-message-input';
 import {
   bindOwnerMaterialsToSession,
   SessionMaterialBindingError,
@@ -40,65 +40,24 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       return new Response('Not found', { status: 404, headers: responseHeaders });
     }
 
-    let body: {
-      text?: string;
-      materialIds?: unknown;
-      elementRefs?: unknown;
-      courseRefs?: unknown;
-      /** The interface language the message is sent from; an unsupported value is ignored. */
-      locale?: unknown;
-    } = {};
+    let body: UserMessageBody = {};
     try {
-      body = ((await req.json()) ?? {}) as typeof body;
+      body = ((await req.json()) ?? {}) as UserMessageBody;
     } catch {
       const response = apiError('INVALID_REQUEST', 400, 'invalid JSON body');
       responseHeaders.forEach((value, name) => response.headers.append(name, value));
       return response;
     }
 
-    const text = (body.text ?? '').toString().trim();
-    if (
-      body.materialIds !== undefined &&
-      (!Array.isArray(body.materialIds) || body.materialIds.some((id) => typeof id !== 'string'))
-    ) {
-      const response = apiError('INVALID_REQUEST', 400, 'materialIds must be an array of strings');
+    const parsed = parseUserMessageInput(body);
+    if (!parsed.ok) {
+      const response = apiError(parsed.code, 400, parsed.message);
       responseHeaders.forEach((value, name) => response.headers.append(name, value));
       return response;
     }
-    const materialIds = [...new Set((body.materialIds ?? []).map((id: string) => id.trim()))];
-    if (materialIds.length > 20 || materialIds.some((id) => !id)) {
-      const response = apiError('INVALID_REQUEST', 400, 'materialIds are invalid');
-      responseHeaders.forEach((value, name) => response.headers.append(name, value));
-      return response;
-    }
-    const decodedElementRefs = decodeElementRefs(body.elementRefs ?? []);
-    if (!decodedElementRefs.ok) {
-      const response = apiError('INVALID_REQUEST', 400, decodedElementRefs.error);
-      responseHeaders.forEach((value, name) => response.headers.append(name, value));
-      return response;
-    }
-    const decodedCourseRefs = decodeCourseRefs(body.courseRefs ?? []);
-    // Only a supported code is kept: it names the copy the run's tools load.
-    const locale = supportedLocaleOf(body.locale);
-    if (!decodedCourseRefs.ok) {
-      const response = apiError('INVALID_REQUEST', 400, decodedCourseRefs.error);
-      responseHeaders.forEach((value, name) => response.headers.append(name, value));
-      return response;
-    }
-    if (!text && materialIds.length === 0) {
-      const response = apiError('MISSING_REQUIRED_FIELD', 400, 'text is required');
-      responseHeaders.forEach((value, name) => response.headers.append(name, value));
-      return response;
-    }
-    if (text.length > MAX_SESSION_TEXT_LENGTH) {
-      const response = apiError(
-        'INVALID_REQUEST',
-        400,
-        `text exceeds the ${MAX_SESSION_TEXT_LENGTH} character limit`,
-      );
-      responseHeaders.forEach((value, name) => response.headers.append(name, value));
-      return response;
-    }
+    const { text, materialIds, locale } = parsed.input;
+    const decodedElementRefs = { refs: parsed.input.elementRefs };
+    const decodedCourseRefs = { refs: parsed.input.courseRefs };
 
     await assertWorkspaceModelsAuthorized(ownerId, [
       'agent',
