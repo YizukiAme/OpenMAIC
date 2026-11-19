@@ -21,6 +21,13 @@
  *    EventSource; the folded state survives here, and reattaching resumes from
  *    `lastEventId` instead of replaying the whole run.
  */
+import {
+  applyBranchRequest,
+  assignSegments,
+  initialBranchState,
+  markRunEnd,
+  type BranchState,
+} from './branch-fold';
 import { create } from 'zustand';
 import i18n from 'i18next';
 import { supportedLocaleOf } from '@/lib/i18n/types';
@@ -116,6 +123,11 @@ export interface ChatNode {
   key: string;
   kind: ChatNodeKind;
   text: string;
+  /**
+   * The conversation branch segment this node belongs to (#1317 prototype):
+   * assigned by `lib/workbench/branch-fold` when the node is first folded.
+   */
+  segment?: string;
   /** Product-owned copy resolved at render time; `text` is the zh fallback. */
   copyKey?: WorkbenchCopyKey;
   /** User nodes only: display names from `user_message.data.materials`. */
@@ -388,6 +400,12 @@ export interface WorkbenchFold {
    */
   runCourseStageIds: readonly string[];
   /**
+   * The conversation's branches (#1317 prototype): which segment every chat
+   * node belongs to and which branch is on screen. See `lib/workbench/branch-fold`.
+   * Absent means no branch has been folded yet (the initial state).
+   */
+  branch?: BranchState;
+  /**
    * The page order the agent is generating right now, folded from the
    * `generate_scene` tool card. The course pane reads it to mark that page as
    * in-progress.
@@ -613,6 +631,7 @@ export function createInitialSessionState(): WorkbenchSessionState {
     stageLinkStageIds: [],
     touchedStageIds: [],
     runCourseStageIds: [],
+    branch: initialBranchState(),
     generatingOrder: null,
     // ── In-flight markers ───────────────────────────────────────────────
     thinkingKey: null,
@@ -980,6 +999,40 @@ function settleRunningToolCards(
  * replays from `Last-Event-ID`, browser also has it) never double-appends.
  */
 export function foldEvent(state: WorkbenchFold, event: WorkbenchEvent): WorkbenchFold {
+  const next = foldChatEvent(state, event);
+  if (next === state || event.id <= state.lastEventId) return next;
+  // A frame the run fence dropped (see `foldChatEvent`) moves no branch either.
+  const lifecycleFrame =
+    event.type === 'session_start' ||
+    event.type === 'session_resumed' ||
+    event.type === 'session_end' ||
+    event.type === 'session_interrupted';
+  if (event.attempt > 0 && !lifecycleFrame && state.epoch > 0 && event.attempt !== state.epoch) {
+    return next;
+  }
+  return trackBranches(state, next, event);
+}
+
+/**
+ * Keep the branch tree in step with one folded event (#1317 prototype): a
+ * `branch_request` moves the branch first, then the nodes the event added are
+ * tagged with their segment, then a run's end is recorded on its reply.
+ */
+function trackBranches(
+  state: WorkbenchFold,
+  next: WorkbenchFold,
+  event: WorkbenchEvent,
+): WorkbenchFold {
+  let branch = state.branch ?? initialBranchState();
+  if (event.type === 'branch_request') branch = applyBranchRequest(branch, event.data, event.id);
+  const assigned = assignSegments(state.chat, next.chat, branch);
+  branch = assigned.branch;
+  if (event.type === 'session_end') branch = markRunEnd(branch, event.data);
+  if (assigned.chat === next.chat && branch === next.branch) return next;
+  return { ...next, chat: assigned.chat, branch };
+}
+
+function foldChatEvent(state: WorkbenchFold, event: WorkbenchEvent): WorkbenchFold {
   if (event.id <= state.lastEventId) return state;
   const lifecycleFrame =
     event.type === 'session_start' ||
