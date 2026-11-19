@@ -54,6 +54,8 @@ export const HOST_AGENT_LIFECYCLE = {
    * mid-run) or 'queued' (session was idle; it drives the next run).
    */
   userMessage: 'user_message',
+  /** A durable request to edit, regenerate, or switch. The next run reports its outcome. */
+  branchRequest: 'branch_request',
   /** Sub-step progress inside one long tool call (per-LLM-round-trip). */
   trace: 'trace',
   /**

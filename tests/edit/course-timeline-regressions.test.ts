@@ -491,6 +491,15 @@ describe('a course coming back from another tab', () => {
     expect([past(), future()]).toEqual([0, 1]);
   });
 
+  it('does not resurrect undo after another branch replaced the course while away', () => {
+    load([slide('a', '<p>old</p>')], 'a');
+    commitCourseEdit({}, () => useStageStore.getState().updateScene('a', { title: 'manual' }));
+    switchTo('other', [other('other')]);
+    useCourseTimeline.getState().clearCourse(STAGE);
+    switchTo(STAGE, [slide('a', '<p>selected</p>')]);
+    expect([past(), future()]).toEqual([0, 0]);
+  });
+
   it('dates media gone while it was away from the departure', () => {
     vi.useFakeTimers({ now: 1_000_000, toFake: ['Date'] });
     try {

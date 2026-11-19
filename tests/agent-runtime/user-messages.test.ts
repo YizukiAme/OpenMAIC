@@ -6,6 +6,41 @@ import {
 } from '@/lib/server/agent-runtime/user-messages';
 
 describe('readAgentMessageLog', () => {
+  it('recognizes courses the conversation created when replaying its library receipts', async () => {
+    const events = [
+      { type: 'library_changed', data: { change: 'stage_created', stageId: 'new-course' } },
+      { type: 'library_changed', data: { change: 'stage_renamed', stageId: 'existing-course' } },
+    ].map((event, i) => ({ ...event, id: i + 1, ts: 1, attempt: 1 }));
+    const log = await readAgentMessageLog(
+      { readEventsAfter: async () => events, listUserMessages: async () => [] },
+      's',
+    );
+    expect(log.createdStageIds).toEqual(new Set(['new-course']));
+  });
+
+  it('delivers an edit only after its branch was applied, keeping later ordinary messages', async () => {
+    const events = [
+      { id: 1, type: 'session_start', data: {} },
+      { id: 2, type: 'branch_request', data: { op: 'edit', targetSeq: 1 } },
+      { id: 3, type: 'user_message', data: { text: 'edited text' } },
+      { id: 4, type: 'user_message', data: { text: 'ordinary follow-up' } },
+    ] as Array<{ id: number; type: string; data: unknown }>;
+    const store = {
+      readEventsAfter: async () => events.map((event) => ({ ...event, attempt: 1, ts: 1 })),
+      listUserMessages: async () => [],
+    };
+    const messages = async () => (await listAgentUserMessages(store, 's')).map((m) => m.text);
+    expect(await messages()).toEqual(['ordinary follow-up']);
+    events.push({
+      id: 5,
+      type: 'session_end',
+      data: { branches: [{ requestSeq: 2, status: 'rejected' }] },
+    });
+    expect(await messages()).toEqual(['ordinary follow-up']);
+    events[4]!.data = { branches: [{ requestSeq: 2, status: 'applied' }] };
+    expect(await messages()).toEqual(['edited text', 'ordinary follow-up']);
+  });
+
   it('replays recovery boundaries across pages without losing user message context', async () => {
     const events: PersistedAgentSessionEvent[] = Array.from({ length: 500 }, (_, i) => ({
       id: i + 1,

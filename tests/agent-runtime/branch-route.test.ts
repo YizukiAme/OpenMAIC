@@ -6,7 +6,8 @@ const mocks = vi.hoisted(() => ({
   postUserMessage: vi.fn(),
   appendControlEvent: vi.fn(),
   requeueSession: vi.fn(),
-  listUserMessages: vi.fn(),
+  readEventsAfter: vi.fn(),
+  query: vi.fn(),
   bindOwnerMaterialsToSession: vi.fn(),
   listPendingMediaTasks: vi.fn(),
 }));
@@ -21,13 +22,21 @@ vi.mock('@/lib/server/identity/resolve', async () =>
 vi.mock('@/lib/server/agent-runtime/store', () => ({
   getAgentSessionStore: async () => ({
     getSession: mocks.getSession,
+    readEventsAfter: mocks.readEventsAfter,
+  }),
+  agentSessionStoreIn: () => ({
     postUserMessage: mocks.postUserMessage,
     appendControlEvent: mocks.appendControlEvent,
     requeueSession: mocks.requeueSession,
-    listUserMessages: mocks.listUserMessages,
+  }),
+}));
+vi.mock('@/lib/persistence/server-provider', () => ({
+  getServerPersistenceProvider: async () => ({
+    withTransaction: (body: (tx: unknown) => unknown) => body({ query: mocks.query }),
   }),
 }));
 vi.mock('@/lib/server/agent-runtime/session-materials', () => ({
+  getAgentSessionMaterialStore: vi.fn(),
   SessionMaterialBindingError: class SessionMaterialBindingError extends Error {},
   bindOwnerMaterialsToSession: mocks.bindOwnerMaterialsToSession,
 }));
@@ -52,7 +61,10 @@ beforeEach(() => {
   mocks.appendControlEvent.mockResolvedValue(21);
   mocks.requeueSession.mockResolvedValue(true);
   mocks.postUserMessage.mockResolvedValue({ seq: 22, delivery: 'queued', requeued: true });
-  mocks.listUserMessages.mockResolvedValue([{ seq: 7, text: 'add a video', materials: [] }]);
+  mocks.readEventsAfter.mockResolvedValue([
+    { id: 7, type: 'user_message', data: { text: 'add a video' } },
+  ]);
+  mocks.query.mockResolvedValue({ rows: [{ status: 'succeeded' }] });
   mocks.bindOwnerMaterialsToSession.mockResolvedValue([]);
   mocks.listPendingMediaTasks.mockReturnValue([]);
 });

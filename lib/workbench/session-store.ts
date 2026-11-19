@@ -22,12 +22,13 @@
  *    `lastEventId` instead of replaying the whole run.
  */
 import {
-  applyBranchOutcomes,
-  applyBranchRequest,
   assignSegments,
+  branchReceipts,
+  checkoutBranch,
   initialBranchState,
   markRunEnd,
-  type BranchRejectionNotice,
+  recordBranchProgress,
+  type BranchReceipt,
   type BranchState,
 } from './branch-fold';
 import { create } from 'zustand';
@@ -475,6 +476,8 @@ export interface WorkbenchFold {
 export interface WorkbenchSessionState extends WorkbenchFold {
   sessionId: string | null;
   attached: boolean;
+  /** The editor whose local changes are being saved for a branch request. */
+  branchEditStageId: string | null;
   /**
    * Whether the conversation was started beside an existing course: the
    * session's durable `existingCourse` flag, from the sessions list or the
@@ -607,6 +610,7 @@ export function createInitialSessionState(): WorkbenchSessionState {
     // early without one). That is the infinite spinner a new conversation landed
     // in. `attach()` arms it explicitly instead.
     replaying: false,
+    branchEditStageId: null,
     replayedStageLinkCount: 0,
     playbackOn: false,
     // ── The run ─────────────────────────────────────────────────────────
@@ -1001,88 +1005,104 @@ function settleRunningToolCards(
  * replays from `Last-Event-ID`, browser also has it) never double-appends.
  */
 export function foldEvent(state: WorkbenchFold, event: WorkbenchEvent): WorkbenchFold {
-  const next = foldChatEvent(state, event);
-  if (next === state || event.id <= state.lastEventId) return next;
-  // A frame the run fence dropped (see `foldChatEvent`) moves no branch either.
-  const lifecycleFrame =
-    event.type === 'session_start' ||
-    event.type === 'session_resumed' ||
-    event.type === 'session_end' ||
-    event.type === 'session_interrupted';
-  if (event.attempt > 0 && !lifecycleFrame && state.epoch > 0 && event.attempt !== state.epoch) {
-    return next;
-  }
-  return trackBranches(state, next, event);
-}
-
-/**
- * Keep the branch tree in step with one folded event (#1317 prototype): a
- * `branch_request` moves the branch first, then the nodes the event added are
- * tagged with their segment, then a run's end is recorded on its reply.
- */
-const BRANCH_REJECTION_COPY = {
-  rollback_failed: 'workbench.system.branchRollbackFailed',
-  edit: 'workbench.system.branchEditSentAsNew',
-  not_applied: 'workbench.system.branchNotApplied',
-  rejected: 'workbench.system.branchRejected',
-} as const satisfies Record<BranchRejectionNotice, string>;
-
-function trackBranches(
-  state: WorkbenchFold,
-  next: WorkbenchFold,
-  event: WorkbenchEvent,
-): WorkbenchFold {
-  let branch = state.branch ?? initialBranchState();
-  let chat = next.chat;
-  if (event.type === 'branch_request') branch = applyBranchRequest(branch, event.data, event.id);
-  if (
-    event.type === 'session_start' ||
-    event.type === 'session_resumed' ||
-    event.type === 'session_end'
-  ) {
-    const outcomes = applyBranchOutcomes(branch, event.data);
-    branch = outcomes.state;
-    if (outcomes.rejected > 0) {
-      const copyKey = BRANCH_REJECTION_COPY[outcomes.notice ?? 'rejected'];
-      chat = [
-        ...chat,
-        {
-          key: `e${event.id}-branch`,
-          kind: 'system',
-          tone: 'error',
-          text: defaultWorkbenchTranslator(copyKey),
-          copyKey,
-        },
-      ];
-    }
-  }
-  const assigned = assignSegments(state.chat, chat, branch);
-  branch = assigned.branch;
-  if (event.type === 'session_end') branch = markRunEnd(branch, event.data);
-  if (assigned.chat === next.chat && branch === next.branch) return next;
-  return { ...next, chat: assigned.chat, branch };
-}
-
-function foldChatEvent(state: WorkbenchFold, event: WorkbenchEvent): WorkbenchFold {
   if (event.id <= state.lastEventId) return state;
   const lifecycleFrame =
     event.type === 'session_start' ||
     event.type === 'session_resumed' ||
     event.type === 'session_end' ||
     event.type === 'session_interrupted';
-  // Fold-local fencing: attempt counts consecutive failures and can reset, so
-  // lifecycle frames may establish any positive epoch (including 1 after an
-  // earlier epoch 6). Ordinary frames can never re-anchor it: once anchored,
-  // their attempt must match exactly, so a late higher-attempt zombie cannot
-  // poison a reset-down run. Before any lifecycle anchor, the first positive
-  // ordinary frame is accepted for backward compatibility but does not set
-  // epoch. Dropped frames still consume seq; control-plane frames
-  // (`attempt === 0`) are exempt.
+  // Lifecycle frames re-anchor the attempt; control-plane frames always pass.
   if (event.attempt > 0 && !lifecycleFrame && state.epoch > 0 && event.attempt !== state.epoch) {
     return { ...state, lastEventId: event.id };
   }
+  const branch = state.branch ?? initialBranchState();
+  if (event.type === 'branch_request' || (branch.inbox.length && event.type === 'user_message')) {
+    return {
+      ...state,
+      lastEventId: event.id,
+      branch: { ...branch, inbox: [...branch.inbox, event] },
+    };
+  }
+  const receipts = lifecycleFrame ? branchReceipts(event.data) : [];
+  let active: WorkbenchFold = state.branch ? state : { ...state, branch };
+  if (receipts.length) {
+    const inbox = branch.inbox;
+    active = { ...active, branch: { ...branch, inbox: [], lastReceipt: receipts.at(-1) } };
+    const rejectedEdits = new Set<number>();
+    for (const buffered of inbox) {
+      if (buffered.type === 'branch_request') {
+        const receipt = receipts.find((r) => r.requestSeq === buffered.id);
+        if (receipt?.status === 'applied') active = checkoutBranch(active, buffered);
+        else if (receipt?.op === 'edit') rejectedEdits.add(buffered.id + 1);
+      } else if (!rejectedEdits.has(buffered.id)) {
+        // Each edit and its text are adjacent in the durable log. Ordinary
+        // sends from another tab belong where the worker actually landed.
+        active = foldActiveEvent(active, buffered);
+      }
+    }
+  }
+  return foldActiveEvent(active, event, receipts);
+}
+
+function branchNotice(receipt: BranchReceipt): WorkbenchCopyKey {
+  if (receipt.rollbackFailed) return 'workbench.system.branchRollbackFailed';
+  if (receipt.reason === 'version_unavailable') return 'workbench.system.branchVersionUnavailable';
+  if (receipt.reason === 'media_pending') return 'workbench.chat.branchMediaPending';
+  if (receipt.reason === 'checkout_failed' || receipt.reason === 'apply_failed')
+    return 'workbench.system.branchNotApplied';
+  return 'workbench.system.branchRejected';
+}
+
+function foldActiveEvent(
+  state: WorkbenchFold,
+  event: WorkbenchEvent,
+  receipts: BranchReceipt[] = [],
+): WorkbenchFold {
+  const next = foldChatEvent(state, event);
+  if (
+    receipts.some(
+      (r) =>
+        r.status === 'applied' && r.checkedOut?.some((course) => course.outcome === 'restored'),
+    )
+  ) {
+    // A version can also replace the name or page count shown in the course list.
+    next.libraryRevision += 1;
+  }
+  for (const receipt of receipts) {
+    if (receipt.status !== 'rejected') continue;
+    const copyKey = branchNotice(receipt);
+    next.chat = [
+      ...next.chat,
+      {
+        key: `e${event.id}-branch-${receipt.requestSeq}`,
+        kind: 'system',
+        tone: 'error',
+        copyKey,
+        text: defaultWorkbenchTranslator(copyKey),
+      },
+    ];
+  }
+  const assigned = assignSegments(state.chat, next.chat, state.branch!);
+  next.branch = assigned.branch;
+  next.chat = assigned.chat;
+  if (
+    next.plan !== state.plan ||
+    next.pages !== state.pages ||
+    next.courseTitle !== state.courseTitle
+  ) {
+    next.branch = recordBranchProgress(next.branch, next);
+  }
+  if (event.type === 'session_end') next.branch = markRunEnd(next.branch, event.data);
+  return next;
+}
+
+function foldChatEvent(state: WorkbenchFold, event: WorkbenchEvent): WorkbenchFold {
   const next: WorkbenchFold = { ...state, lastEventId: event.id };
-  if (event.attempt > 0 && lifecycleFrame) next.epoch = event.attempt;
+  if (
+    event.attempt > 0 &&
+    ['session_start', 'session_resumed', 'session_end', 'session_interrupted'].includes(event.type)
+  )
+    next.epoch = event.attempt;
   const data = (event.data ?? {}) as Record<string, unknown>;
   const key = `e${event.id}`;
 
@@ -2227,7 +2247,7 @@ export type WorkbenchBranchRequest =
 export async function branchWorkbenchSession(
   sessionId: string,
   request: WorkbenchBranchRequest,
-): Promise<void> {
+): Promise<number> {
   const res = await fetch(`/api/agent/sessions/${encodeURIComponent(sessionId)}/branch`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -2247,11 +2267,16 @@ export async function branchWorkbenchSession(
       body.code ?? body.errorCode,
     );
   }
+  return ((await res.json()) as { requestSeq: number }).requestSeq;
 }
 
-export async function cancelWorkbenchSession(sessionId: string): Promise<void> {
+export async function cancelWorkbenchSession(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<void> {
   const res = await fetch(`/api/agent/sessions/${encodeURIComponent(sessionId)}/cancel`, {
     method: 'POST',
+    signal,
   });
   if (!res.ok) {
     const body = (await res.json().catch(() => ({}))) as {

@@ -20,7 +20,10 @@ const mocks = vi.hoisted(() => {
   // random-per-process value. Capture it from the first appendRunEvent call
   // (the runner passes WORKER_ID as its second argument) and hand it back
   // through getSession so `leaseMatches` sees a live, owned session.
-  const history = { started: false };
+  const history = {
+    started: false,
+    events: [] as Array<{ id: number; ts: number; attempt: number; type: string; data: unknown }>,
+  };
   let workerId: string | undefined;
   let sessionId = 'session-wake';
   let deliveredUserMessageSeq = 0;
@@ -52,6 +55,7 @@ const mocks = vi.hoisted(() => {
       afterSeq > 0
         ? []
         : [
+            ...history.events,
             ...(history.started
               ? [{ id: 1, ts: 1, attempt: 1, type: 'run_started', data: {} }]
               : []),
@@ -67,7 +71,7 @@ const mocks = vi.hoisted(() => {
                 locale: message.locale,
               },
             })),
-          ],
+          ].sort((a, b) => a.id - b.id),
     ),
     heartbeat: vi.fn(async () => true),
     markUserMessageDelivered: vi.fn(async (_id, _worker, _attempt, messageSeq: number) => {
@@ -106,6 +110,7 @@ const mocks = vi.hoisted(() => {
     /** Transcript the next run finds in its entry tree (a run cut off mid-turn). */
     entrySeed: [] as unknown[],
     history,
+    tree: undefined as import('@earendil-works/pi-agent-core').Session | undefined,
     /** The default event append; a test that replaces it leaves it replaced. */
     recordWorker,
     resetWorker: () => {
@@ -175,10 +180,13 @@ vi.mock('@/lib/server/agent-runtime/entry-tree-storage', async (importActual) =>
     AgentSessionEntryStorage: {
       open: async ({ sessionId }: { sessionId: string }) => {
         const storage = (await new InMemorySessionRepo().create({ id: sessionId })).getStorage();
+        mocks.tree = new Session(storage);
         if (mocks.entrySeed.length) {
           const seeded = new Session(storage);
           for (const message of mocks.entrySeed.splice(0)) {
-            await seeded.appendMessage(message as never);
+            const custom = message as { customType?: string; data?: unknown };
+            if (custom.customType) await seeded.appendCustomEntry(custom.customType, custom.data);
+            else await seeded.appendMessage(message as never);
           }
         }
         return storage;
@@ -378,7 +386,6 @@ vi.mock('@earendil-works/pi-agent-core', async (importOriginal) => {
 });
 
 const branching = vi.hoisted(() => ({
-  readPendingBranchRequests: vi.fn(async () => [] as Array<{ seq: number; data: unknown }>),
   applyBranchRequests: vi.fn(),
   recordCourseVersions: vi.fn(
     async (_deps: unknown, _input: { phase: string; status?: string }) =>
@@ -391,7 +398,10 @@ vi.mock('@/lib/server/course-versions/store', async (importActual) => ({
   ensureCourseVersionStore: vi.fn(async () => undefined),
 }));
 vi.mock('@/lib/persistence/server-provider', () => ({
-  getServerPersistenceProvider: vi.fn(async () => ({ pool: {}, withTransaction: vi.fn() })),
+  getServerPersistenceProvider: vi.fn(async () => ({
+    pool: { query: async () => ({ rows: [] }) },
+    withTransaction: vi.fn(),
+  })),
 }));
 
 import { runSession } from '@/lib/server/agent-runtime/runner';
@@ -434,22 +444,33 @@ async function waitForPrompt(): Promise<void> {
   await vi.waitFor(() => expect(fake.current.instance?.promptCalls ?? 0).toBeGreaterThan(0));
 }
 
+function pendingRequests(requests: Array<{ seq: number; data: unknown }>) {
+  mocks.history.events.push(
+    ...requests.map(({ seq, data }) => ({
+      id: seq,
+      type: 'branch_request',
+      ts: 1,
+      attempt: 0,
+      data,
+    })),
+  );
+}
+
 describe('runSession and branch requests', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     fake.current.instance?.reset();
     fake.current.instance = undefined;
+    mocks.history.events = [];
+    mocks.entrySeed.length = 0;
     mocks.resetWorker();
     mocks.store.listUserMessages.mockResolvedValue([]);
-    branching.readPendingBranchRequests.mockResolvedValue([]);
     branching.recordCourseVersions.mockResolvedValue([]);
   });
 
   it('settles a switch-only claim without prompting, and reports the switch', async () => {
     mocks.entrySeed.push(userTurn('Build a lesson'), finishedReply('three pages'));
-    branching.readPendingBranchRequests.mockResolvedValue([
-      { seq: 9, data: { op: 'switch', targetSeq: 0, variant: 'orig' } },
-    ]);
+    pendingRequests([{ seq: 9, data: { op: 'switch', targetSeq: 0, variant: 'orig' } }]);
     branching.applyBranchRequests.mockResolvedValue({
       outcomes: [{ requestSeq: 9, op: 'switch', status: 'applied', checkedOut: [] }],
       regenerated: false,
@@ -483,9 +504,7 @@ describe('runSession and branch requests', () => {
     mocks.store.listUserMessages.mockResolvedValue([
       { seq: 3, ts: 1, text: 'add a video', delivery: 'queued', materials: [] },
     ]);
-    branching.readPendingBranchRequests.mockResolvedValue([
-      { seq: 7, data: { op: 'regenerate', targetSeq: 3 } },
-    ]);
+    pendingRequests([{ seq: 7, data: { op: 'regenerate', targetSeq: 3 } }]);
     branching.applyBranchRequests.mockResolvedValue({
       outcomes: [
         { requestSeq: 7, op: 'regenerate', status: 'rejected', reason: 'checkout_failed' },
@@ -510,6 +529,186 @@ describe('runSession and branch requests', () => {
     });
   });
 
+  it('never sends a rejected edit, even when another message was posted after it', async () => {
+    mocks.entrySeed.push(userTurn('Build a lesson'), finishedReply('Old course'));
+    pendingRequests([{ seq: 7, data: { op: 'edit', targetSeq: 3 } }]);
+    mocks.store.listUserMessages.mockResolvedValue([
+      { seq: 8, ts: 1, text: 'Discard my whole course', delivery: 'queued', materials: [] },
+      {
+        seq: 9,
+        ts: 1,
+        text: 'Keep working on the original course',
+        delivery: 'queued',
+        materials: [],
+      },
+    ]);
+    branching.applyBranchRequests.mockResolvedValue({
+      outcomes: [{ requestSeq: 7, op: 'edit', status: 'rejected', reason: 'checkout_failed' }],
+      regenerated: false,
+    });
+    const run = runSession(
+      { running: new Map(), shuttingDown: false },
+      { ...SESSION, deliveredUserMessageSeq: 3 },
+    );
+    try {
+      await waitForPrompt();
+      expect(fake.current.instance!.state.messages).toContainEqual(
+        expect.objectContaining({
+          content: [{ type: 'text', text: 'Keep working on the original course' }],
+        }),
+      );
+      expect(JSON.stringify(fake.current.instance!.state.messages)).not.toContain(
+        'Discard my whole course',
+      );
+    } finally {
+      fake.current.instance?.releasePrompt();
+      await run;
+    }
+  });
+
+  it('delivers an accepted edit on this claim, before a later queued message', async () => {
+    mocks.entrySeed.push(userTurn('Build a lesson'), finishedReply('Original baseline'));
+    pendingRequests([{ seq: 7, data: { op: 'edit', targetSeq: 3 } }]);
+    mocks.store.listUserMessages.mockResolvedValue([
+      { seq: 8, ts: 1, text: 'New version', delivery: 'queued', materials: [] },
+      { seq: 9, ts: 1, text: 'Another follow-up', delivery: 'queued', materials: [] },
+    ]);
+    branching.applyBranchRequests.mockResolvedValue({
+      outcomes: [{ requestSeq: 7, op: 'edit', status: 'applied' }],
+      regenerated: false,
+    });
+    const run = runSession(
+      { running: new Map(), shuttingDown: false },
+      { ...SESSION, deliveredUserMessageSeq: 3 },
+    );
+    try {
+      await waitForPrompt();
+      expect(fake.current.instance!.state.messages[0]).toMatchObject({
+        openmaicDurableUserMessageSeq: 8,
+        content: [{ type: 'text', text: 'New version' }],
+      });
+    } finally {
+      fake.current.instance?.releasePrompt();
+      await run;
+    }
+  });
+
+  it('does not resume an interrupted reply when recovering after its switch-only receipt', async () => {
+    mocks.entrySeed.push(userTurn('Interrupted question'));
+    mocks.history.events.push({
+      id: 5,
+      ts: 1,
+      attempt: 1,
+      type: 'session_end',
+      data: {
+        status: 'succeeded',
+        note: 'branch requests only',
+        branches: [{ requestSeq: 2, status: 'applied' }],
+      },
+    });
+    const run = runSession(
+      { running: new Map(), shuttingDown: false },
+      { ...SESSION, claimReason: 'orphaned' },
+    );
+    await vi.waitFor(() =>
+      expect(
+        fake.current.instance?.promptCalls || mocks.store.finishSession.mock.calls.length,
+      ).toBeGreaterThan(0),
+    );
+    fake.current.instance?.releasePrompt();
+    await run;
+    expect(fake.current.instance).toBeUndefined();
+  });
+
+  it('takes a before-turn snapshot when a follow-up is consumed by a running agent', async () => {
+    const run = runSession({ running: new Map(), shuttingDown: false }, SESSION);
+    try {
+      await waitForPrompt();
+      mocks.store.listUserMessages.mockResolvedValue([
+        { seq: 7, ts: 1, text: 'Steered follow-up', delivery: 'steer', materials: [] },
+      ]);
+      mocks.bus.wake?.();
+      await vi.waitFor(() => expect(fake.current.instance?.steerCalls).toHaveLength(1));
+    } finally {
+      fake.current.instance?.releasePrompt();
+      await run;
+    }
+    expect(branching.recordCourseVersions.mock.calls.map(([, input]) => input.phase)).toEqual([
+      'before_run',
+      'before_run',
+      'after_run',
+    ]);
+  });
+
+  it('records what a tool left behind when the agent throws during the run', async () => {
+    const prompt = vi
+      .spyOn(fake.FakeAgent.prototype, 'prompt')
+      .mockRejectedValue(new Error('driver failed mid-run'));
+    try {
+      await runSession({ running: new Map(), shuttingDown: false }, SESSION);
+      expect(branching.recordCourseVersions).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          phase: 'after_run',
+          status: 'failed',
+        }),
+      );
+    } finally {
+      prompt.mockRestore();
+    }
+  });
+
+  it('marks a failed before-turn capture so this message cannot silently reuse an older course', async () => {
+    branching.recordCourseVersions.mockRejectedValueOnce(new Error('snapshot unavailable'));
+    const run = runSession({ running: new Map(), shuttingDown: false }, SESSION);
+    try {
+      await waitForPrompt();
+      expect(await mocks.tree?.getBranch()).toContainEqual(
+        expect.objectContaining({
+          customType: 'openmaic.course_versions',
+          data: expect.objectContaining({ phase: 'before_run', unavailable: true }),
+        }),
+      );
+    } finally {
+      fake.current.instance?.releasePrompt();
+      await run;
+    }
+  });
+
+  it('captures the course named by an element before the first edit to that course', async () => {
+    mocks.entrySeed.push(userTurn('Opening'), finishedReply('Original course'));
+    mocks.history.events.push({
+      id: 3,
+      type: 'user_message',
+      ts: 1,
+      attempt: 0,
+      data: {
+        text: 'Change the selected title',
+        elementRefs: [
+          {
+            kind: 'slide-element',
+            stageId: 'other-course',
+            sceneId: 'p1',
+            elementId: 't1',
+            elementType: 'text',
+            label: 'Title',
+          },
+        ],
+      },
+    });
+    const run = runSession({ running: new Map(), shuttingDown: false }, SESSION);
+    try {
+      await waitForPrompt();
+      const capture = branching.recordCourseVersions.mock.calls[0]?.[1] as {
+        extraStageIds?: Iterable<string>;
+      };
+      expect(Array.from(capture.extraStageIds ?? [])).toContain('other-course');
+    } finally {
+      fake.current.instance?.releasePrompt();
+      await run;
+    }
+  });
+
   it('answers the message a regenerate moved onto, with the receipt on the first frame', async () => {
     // What the apply step leaves: the leaf on the user frame being answered again.
     mocks.entrySeed.push(
@@ -520,9 +719,7 @@ describe('runSession and branch requests', () => {
     mocks.store.listUserMessages.mockResolvedValue([
       { seq: 3, ts: 1, text: 'add a video', delivery: 'queued', materials: [] },
     ]);
-    branching.readPendingBranchRequests.mockResolvedValue([
-      { seq: 7, data: { op: 'regenerate', targetSeq: 3 } },
-    ]);
+    pendingRequests([{ seq: 7, data: { op: 'regenerate', targetSeq: 3 } }]);
     branching.applyBranchRequests.mockResolvedValue({
       outcomes: [{ requestSeq: 7, op: 'regenerate', status: 'applied', checkedOut: [] }],
       regenerated: true,
@@ -569,5 +766,146 @@ describe('runSession and branch requests', () => {
     expect(end?.data).toMatchObject({
       courseVersions: [{ stageId: 'stage-1', versionId: 'cv-1' }],
     });
+  });
+
+  it('regenerates first even if a subsequent plain message is already queued', async () => {
+    mocks.entrySeed.push(
+      userTurn('Opening'),
+      finishedReply('Course'),
+      userTurn('Regenerate this', 3),
+    );
+    pendingRequests([{ seq: 7, data: { op: 'regenerate', targetSeq: 3 } }]);
+    branching.applyBranchRequests.mockResolvedValue({
+      outcomes: [{ requestSeq: 7, op: 'regenerate', status: 'applied' }],
+      regenerated: true,
+    });
+    mocks.store.listUserMessages.mockResolvedValue([
+      { seq: 3, ts: 1, text: 'Regenerate this', delivery: 'queued', materials: [] },
+      { seq: 8, ts: 1, text: 'Next question', delivery: 'queued', materials: [] },
+    ]);
+    const next = vi.spyOn(fake.FakeAgent.prototype, 'continue');
+    const run = runSession(
+      { running: new Map(), shuttingDown: false },
+      { ...SESSION, deliveredUserMessageSeq: 3 },
+    );
+    try {
+      await waitForPrompt();
+      expect(next).toHaveBeenCalledOnce();
+      expect(fake.current.instance!.state.messages[0]).not.toHaveProperty(
+        'openmaicDurableUserMessageSeq',
+        8,
+      );
+    } finally {
+      fake.current.instance?.releasePrompt();
+      await run;
+      next.mockRestore();
+    }
+  });
+
+  it('prompts an accepted edit when a new worker recovers before its first user frame', async () => {
+    mocks.entrySeed.push(
+      userTurn('Opening'),
+      finishedReply('Course'),
+      userTurn('Steered question', 3),
+    );
+    pendingRequests([{ seq: 7, data: { op: 'edit', targetSeq: 4 } }]);
+    mocks.history.events.push({
+      id: 9,
+      ts: 1,
+      attempt: 1,
+      type: 'session_resumed',
+      data: {
+        branches: [{ requestSeq: 7, op: 'edit', status: 'applied' }],
+      },
+    });
+    mocks.store.listUserMessages.mockResolvedValue([
+      { seq: 8, ts: 1, text: 'Edited instruction', delivery: 'queued', materials: [] },
+    ]);
+    const run = runSession(
+      { running: new Map(), shuttingDown: false },
+      { ...SESSION, claimReason: 'orphaned', deliveredUserMessageSeq: 4 },
+    );
+    try {
+      await waitForPrompt();
+      expect(fake.current.instance!.state.messages[0]).toMatchObject({
+        openmaicDurableUserMessageSeq: 8,
+      });
+    } finally {
+      fake.current.instance?.releasePrompt();
+      await run;
+    }
+  });
+
+  it('recovers an interrupted regeneration using the selected message, including its Skill', async () => {
+    mocks.entrySeed.push(
+      userTurn('Opening'),
+      finishedReply('Course'),
+      userTurn('Old instruction', 3),
+      {
+        customType: 'openmaic.reply_variant',
+        data: { requestSeq: 12 },
+      },
+    );
+    mocks.store.listUserMessages.mockResolvedValue([
+      { seq: 3, ts: 1, text: 'Old instruction', delivery: 'queued', materials: [] },
+      {
+        seq: 9,
+        ts: 1,
+        text: '/other-skill from a different branch',
+        delivery: 'queued',
+        materials: [],
+      },
+    ]);
+    const preload = vi.spyOn(
+      await import('@/lib/server/agent-runtime/skill-preload'),
+      'buildSkillPreload',
+    );
+    const run = runSession(
+      { running: new Map(), shuttingDown: false },
+      { ...SESSION, claimReason: 'orphaned', deliveredUserMessageSeq: 9 },
+    );
+    try {
+      await waitForPrompt();
+      expect(preload).toHaveBeenCalledWith(expect.objectContaining({ text: 'Old instruction' }));
+    } finally {
+      fake.current.instance?.releasePrompt();
+      await run;
+      preload.mockRestore();
+    }
+  });
+
+  it('does not deliver an edit twice after its user frame committed before the delivery cursor', async () => {
+    mocks.entrySeed.push(
+      userTurn('Opening'),
+      finishedReply('Course'),
+      userTurn('Edited instruction', 8),
+    );
+    pendingRequests([{ seq: 7, data: { op: 'edit', targetSeq: 4 } }]);
+    mocks.history.events.push({
+      id: 9,
+      ts: 1,
+      attempt: 1,
+      type: 'session_resumed',
+      data: {
+        branches: [{ requestSeq: 7, op: 'edit', status: 'applied' }],
+      },
+    });
+    mocks.store.listUserMessages.mockResolvedValue([
+      { seq: 8, ts: 1, text: 'Edited instruction', delivery: 'queued', materials: [] },
+    ]);
+    const run = runSession(
+      { running: new Map(), shuttingDown: false },
+      { ...SESSION, claimReason: 'orphaned', deliveredUserMessageSeq: 4 },
+    );
+    await waitForPrompt();
+    fake.current.instance?.releasePrompt();
+    await run;
+    expect(fake.current.instance!.steerCalls).toEqual([]);
+    expect(mocks.store.markUserMessageDelivered).toHaveBeenCalledWith(
+      SESSION.id,
+      expect.any(String),
+      1,
+      8,
+    );
   });
 });

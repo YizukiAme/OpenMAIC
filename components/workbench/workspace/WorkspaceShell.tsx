@@ -1680,7 +1680,7 @@ function WorkspaceShellController({ initialPanes }: { readonly initialPanes: Wor
    * canvas. Freshness sync now simply complements the classroom's ordinary
    * load, independent of which conversations happen to be running.
    */
-  useStageFreshnessSync(panes.courseId);
+  const restoringCourse = useStageFreshnessSync(panes.courseId);
 
   // Leaving full-screen playback behind when the course closes: the flag is
   // session state and would otherwise blank the next surface.
@@ -2231,6 +2231,7 @@ function WorkspaceShellController({ initialPanes }: { readonly initialPanes: Wor
             browser={classroomBrowser}
             hidden={!classroomOpen || previewShowing}
             readOnly={readOnlyCourse}
+            restoring={restoringCourse}
             // Not known yet is read-only too, but says nothing until it is known.
             readOnlyKnown={courseAccess !== 'unknown'}
             fullscreen={playbackOn}

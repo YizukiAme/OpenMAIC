@@ -102,6 +102,11 @@ function sessionStore(queryable: Queryable, withTransaction: WithTransaction): P
   return store;
 }
 
+/** Use the usual URL and notification hooks inside the caller's open transaction. */
+export function agentSessionStoreIn(transaction: Queryable): PgAgentSessionStore {
+  return sessionStore(transaction, (body) => body(transaction));
+}
+
 async function createAgentSessionStore(connectionString: string): Promise<PgAgentSessionStore> {
   const { pool } = await getServerPersistenceProvider(connectionString);
   await withSchemaBootstrapLock(pool as unknown as ConnectableQueryable, ensureAgentSessionSchema);

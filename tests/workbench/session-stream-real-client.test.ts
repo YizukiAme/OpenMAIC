@@ -7,6 +7,8 @@ import { act, createElement, useLayoutEffect } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { projectBranchChat } from '@/lib/workbench/branch-fold';
+import { useCourseTimeline } from '@/lib/edit/course-timeline';
 import { useWorkbenchStore } from '@/lib/workbench/session-store';
 import { useWorkbenchStream } from '@/lib/workbench/use-workbench-session';
 
@@ -84,6 +86,63 @@ const send = (text: string) =>
 const store = () => useWorkbenchStore.getState();
 
 describe('replay on a stream the browser holds back', () => {
+  it('replays the chosen reply, and switches the transcript and course history on a live receipt', async () => {
+    const reply = (id: number, text: string) =>
+      frame(id, 'message_start', { message: { role: 'assistant', content: [] } }) +
+      frame(id + 1, 'message_end', {
+        message: { role: 'assistant', content: [{ type: 'text', text }] },
+      });
+    const receipt = (requestSeq: number, op: string, checkedOut: unknown[] = []) => ({
+      requestSeq,
+      op,
+      status: 'applied',
+      checkedOut,
+    });
+    const selected = () =>
+      store()
+        .chat.filter((n) => n.kind === 'assistant')
+        .map((n) => n.text);
+    await open();
+    await send(
+      frame(1, 'session_start', { prompt: 'Lesson' }) +
+        reply(2, 'List') +
+        frame(4, 'session_end', { status: 'succeeded' }) +
+        frame(5, 'branch_request', { op: 'regenerate', targetSeq: 0 }) +
+        frame(6, 'session_resumed', { reason: 'follow_up', branches: [receipt(5, 'regenerate')] }) +
+        reply(7, 'Quiz') +
+        frame(9, 'session_end', { status: 'succeeded' }) +
+        CAUGHT_UP,
+    );
+    expect(selected()).toEqual(['Quiz']);
+    const selectedReply = store().chat.find((node) => node.text === 'Quiz')!;
+    expect(
+      projectBranchChat(store().chat, store().branch!).forks.get(selectedReply.segment!),
+    ).toMatchObject({ index: 1, count: 2 });
+
+    const timeline = useCourseTimeline.getState();
+    for (const stage of ['changed', 'other']) timeline.updateLine(stage, (line) => line);
+    await send(frame(10, 'branch_request', { op: 'switch', targetSeq: 0, variant: 'orig' }));
+    expect(selected()).toEqual(['Quiz']);
+    expect(useCourseTimeline.getState().lines.changed).toBeDefined();
+    await send(
+      frame(11, 'session_end', {
+        status: 'succeeded',
+        note: 'branch requests only',
+        branches: [
+          receipt(10, 'switch', [
+            { stageId: 'changed', versionId: 'v1', outcome: 'restored' },
+            { stageId: 'other', versionId: 'v2', outcome: 'unchanged' },
+          ]),
+        ],
+      }),
+    );
+    expect(selected()).toEqual(['List']);
+    expect(store().libraryRevision).toBe(1);
+    expect(useCourseTimeline.getState().lines.changed).toBeUndefined();
+    expect(useCourseTimeline.getState().lines.other).toBeDefined();
+    timeline.clearCourse('other');
+  });
+
   it.each([1_000, 20_001, 60_000, 119_000])(
     'an old course link stays history when the request waits %i ms',
     async (heldMs) => {

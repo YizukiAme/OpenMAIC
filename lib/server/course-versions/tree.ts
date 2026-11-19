@@ -37,13 +37,14 @@ export interface TreeEntry {
 export interface CourseVersionsEntryData {
   phase: 'before_run' | 'after_run' | 'before_switch';
   versions: Array<{ stageId: string; versionId: string }>;
+  /** Snapshot failed. Versions further up this path cannot stand in for it. */
+  unavailable?: true;
   /** After-run entries only: how the run ended. */
   status?: string;
   /**
    * Before-switch entries a branch request writes: the request's event
-   * sequence. The request writes this entry even when no course changed, so a
-   * claim that applies the request again after dying part-way can tell it had
-   * already started.
+   * sequence. The current format writes the checked-out courses in the same
+   * transaction, so a new worker can recover the exact committed result.
    */
   requestSeq?: number;
 }
@@ -57,12 +58,12 @@ function customOf(entry: TreeEntry, customType: string): unknown {
   return entry.type === 'custom' && entry.customType === customType ? entry.data : undefined;
 }
 
-/** The before-switch entry a branch request wrote, if it got that far. */
+/** The latest source snapshot for a request, including a completed legacy retry. */
 export function beforeSwitchEntryOf(
   entries: readonly TreeEntry[],
   requestSeq: number,
 ): TreeEntry | undefined {
-  return entries.find((entry) => {
+  return entries.findLast((entry) => {
     const data = customOf(entry, COURSE_VERSIONS_ENTRY) as CourseVersionsEntryData | undefined;
     return data?.phase === 'before_switch' && data.requestSeq === requestSeq;
   });
@@ -196,6 +197,7 @@ export type BranchRejectReason =
   | 'invalid_request'
   | 'target_not_found'
   | 'variant_not_found'
+  | 'version_unavailable'
   | 'opening_message_not_editable';
 
 export function parseBranchRequest(data: unknown): BranchRequestData | null {
@@ -248,7 +250,9 @@ export function planBranchMove(
     case 'edit':
       // Moving to the root would make the next run a fresh start, which reads
       // the session's own prompt rather than the edited message.
-      if (user.parentId === null) return { kind: 'reject', reason: 'opening_message_not_editable' };
+      if (user.id === findUserEntry(entries, 0)?.id) {
+        return { kind: 'reject', reason: 'opening_message_not_editable' };
+      }
       return { kind: 'move', leafId: user.parentId };
     case 'switch': {
       if (request.variant === undefined) {

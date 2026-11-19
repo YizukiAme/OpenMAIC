@@ -90,7 +90,17 @@ vi.mock('@/lib/config/feature-flags', async (original) => ({
   isAgentRuntimeConfigured: () => true,
 }));
 vi.mock('@/lib/persistence/server-provider', () => ({
-  getServerPersistenceProvider: async () => ({ pool: {} }),
+  getServerPersistenceProvider: async () => ({
+    pool: {},
+    withTransaction: (body: (tx: unknown) => unknown) =>
+      body({
+        query: async (sql: string) => ({
+          rows: sql.includes('FROM agent_sessions')
+            ? [{ status: 'succeeded', open_question_seq: null }]
+            : [],
+        }),
+      }),
+  }),
 }));
 vi.mock('@/lib/persistence/workspace-model-config', async (original) => ({
   ...(await original<typeof import('@/lib/persistence/workspace-model-config')>()),
@@ -124,6 +134,13 @@ vi.mock('@/lib/server/generate-classroom-job', async (original) => ({
   classroomJobView: () => ({ jobId: 'run' }),
 }));
 vi.mock('@/lib/server/agent-runtime/store', () => ({
+  agentSessionStoreIn: () => ({
+    appendControlEvent: async () => 1,
+    requeueSession: async () => {
+      mocks.admitted();
+      return true;
+    },
+  }),
   getAgentSessionStore: async () => ({
     readRetirement: async () => null,
     createSession: async () => {
@@ -388,6 +405,15 @@ const ROUTES: RouteCase[] = [
     invoke: async () =>
       (await import('@/app/api/agent/sessions/route')).POST(
         request('/api/agent/sessions', { prompt: 'Teach' }),
+      ),
+  },
+  {
+    path: 'agent/sessions/[id]/branch',
+    admission: true,
+    invoke: async () =>
+      (await import('@/app/api/agent/sessions/[id]/branch/route')).POST(
+        request('/api/agent/sessions/session/branch', { op: 'regenerate', targetSeq: 0 }),
+        { params: Promise.resolve({ id: 'session' }) },
       ),
   },
   {

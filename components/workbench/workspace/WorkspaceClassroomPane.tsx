@@ -59,6 +59,7 @@ export const WorkspaceClassroomPane = memo(function WorkspaceClassroomPane({
   browser,
   readOnly,
   readOnlyKnown = true,
+  restoring = false,
   fullscreen,
   hidden,
   onCollapse,
@@ -92,6 +93,7 @@ export const WorkspaceClassroomPane = memo(function WorkspaceClassroomPane({
    * being asked about is read-only, but is not labelled so until it is.
    */
   readonly readOnlyKnown?: boolean;
+  readonly restoring?: boolean;
   /**
    * Full screen: the pane is the whole window (the rail and the conversation
    * step aside), with a header of its own — leave the course on the left, the
@@ -125,6 +127,13 @@ export const WorkspaceClassroomPane = memo(function WorkspaceClassroomPane({
   const currentSceneId = useStageStore((s) => s.currentSceneId);
   const courseGenerating = useStageStore((s) => s.courseGenerating);
   const setFullscreen = useWorkbenchStore((s) => s.setPlaybackOn);
+  const changingVersion = useWorkbenchStore(
+    (s) =>
+      s.branchEditStageId === courseId ||
+      Boolean(
+        s.branch?.inbox.length && (s.stageId === courseId || s.touchedStageIds.includes(courseId)),
+      ),
+  );
   const loadedCourseId = useStageStore((s) => s.stage?.id);
   const isOwner = useStageStore((s) => s.isOwner);
   const stageReadOnly = useStageStore((s) => s.readOnly);
@@ -145,6 +154,8 @@ export const WorkspaceClassroomPane = memo(function WorkspaceClassroomPane({
     !stageReadOnly &&
     !readOnly &&
     !courseGenerating &&
+    !changingVersion &&
+    !restoring &&
     scenes.length > 0;
   // Full screen does not force learning: it is a size, not a mode.
   const learning = !editingAllowed || preferences[courseId] !== 'editing';
@@ -185,7 +196,13 @@ export const WorkspaceClassroomPane = memo(function WorkspaceClassroomPane({
     <ClassroomModeSwitch
       learning={learning}
       editingAllowed={editingAllowed}
-      editingHint={courseGenerating ? t('workspace.editingUnavailableGenerating') : undefined}
+      editingHint={
+        restoring || changingVersion
+          ? t('workbench.chat.branchRestoring')
+          : courseGenerating
+            ? t('workspace.editingUnavailableGenerating')
+            : undefined
+      }
       onLearn={() => rememberMode('learning')}
       onEdit={() => {
         if (editingAllowed) rememberMode('editing');

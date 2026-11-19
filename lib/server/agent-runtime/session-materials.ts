@@ -248,12 +248,15 @@ export async function bindOwnerMaterialsToSession(
   sessionId: string,
   ownerId: string,
   materialIds: readonly string[],
+  transaction?: Queryable,
 ): Promise<Array<{ materialId: string; originalName?: string; mime?: string; bytes: number }>> {
   const connectionString = process.env.DATABASE_URL;
   if (!connectionString) throw new Error('Agent runtime requires DATABASE_URL');
   // The links table is provisioned with the session-material schema.
-  await getAgentSessionMaterialStore();
-  const provider = await getServerPersistenceProvider(connectionString);
+  if (!transaction) await getAgentSessionMaterialStore();
+  const provider = transaction
+    ? { withTransaction: <T>(body: (tx: Queryable) => Promise<T>) => body(transaction) }
+    : await getServerPersistenceProvider(connectionString);
   const outcome = await attachOwnerMaterialsToSession(provider, {
     sessionId,
     ownerId,

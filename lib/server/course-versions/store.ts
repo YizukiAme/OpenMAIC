@@ -1,36 +1,19 @@
-/**
- * Course versions for edit-and-resend in Pro conversations (#1317, prototype).
- *
- * A course version is an immutable copy of one course document at one moment:
- * its stage row, outline and DSL version, plus the ordered list of its pages.
- * Pages are stored once per distinct content (content-addressed), so a version
- * that changes one page of a forty-page course adds one page row, and a version
- * whose content equals an earlier one of the same course reuses that version.
- *
- * The agent runner takes a version before and after every run, and a branch of
- * the conversation names the version it is on with a non-context entry in the
- * session's entry tree (`./tree.ts`). Switching branches writes the named
- * version back over the live document (`checkoutCourseVersion`), through the
- * same owner-bound document store every agent tool writes through.
- *
- * Assets a version names are held alive by an asset reference root
- * (`asset_root_refs`, kind {@link COURSE_VERSION_ROOT_KIND}), so the collector
- * never reclaims the video an older branch still shows.
- *
- * Deliberately app-side for the prototype: the tables live in their own
- * migration store (`course-versions`) instead of `@openmaic/storage`, so the
- * published package and its document migrations stay untouched. The production
- * home is the storage package's document store.
- */
+/** Immutable course versions on the agent session's message tree. Pages with
+ * equal content share storage. The live document revision skips all page reads
+ * on an unchanged turn, and the document store publishes the normal canvas
+ * revisions on checkout. */
 import { createHash, randomUUID } from 'node:crypto';
 
+import { DSL_VERSION } from '@openmaic/dsl';
 import type { MaicDocument } from '@openmaic/storage';
 import { changeAssetRoots } from '@openmaic/storage/asset/pg';
 import type { Queryable, WithTransaction } from '@openmaic/storage/document/pg';
 import { applySchemaMigrations, type SchemaMigrationSet } from '@openmaic/storage/pg-migrations';
 import type { ConnectableQueryable } from '@openmaic/storage/server/reference';
 
-import { assetPrincipalForOwner } from '@/lib/persistence/owner-assets';
+import { validateAppScene, validateAppStage } from '@/lib/document-store/validators';
+import { assetReferencePrincipalsForOwner } from '@/lib/persistence/owner-assets';
+import { createOwnerBoundDocumentStore } from '@/lib/persistence/owner-bound-document-store';
 import { forwardOwnerWrite } from '@/lib/persistence/owner-merges';
 import { withSchemaBootstrapLock } from '@/lib/persistence/schema-bootstrap-lock';
 
@@ -38,7 +21,7 @@ import { withSchemaBootstrapLock } from '@/lib/persistence/schema-bootstrap-lock
 export const COURSE_VERSION_ROOT_KIND = 'course_version';
 
 /** Why a version was taken. Diagnostic only: nothing branches on it. */
-export type CourseVersionOrigin = 'before_run' | 'after_run' | 'before_switch';
+type CourseVersionOrigin = 'before_run' | 'after_run' | 'before_switch';
 
 const COURSE_VERSION_SCHEMA = `
 CREATE TABLE IF NOT EXISTS course_version_pages (
@@ -67,7 +50,17 @@ CREATE INDEX IF NOT EXISTS course_versions_session_idx
 
 export const COURSE_VERSION_MIGRATIONS: SchemaMigrationSet = {
   store: 'course-versions',
-  migrations: [{ version: 1, name: 'baseline', up: COURSE_VERSION_SCHEMA, transaction: false }],
+  migrations: [
+    { version: 1, name: 'baseline', up: COURSE_VERSION_SCHEMA, transaction: false },
+    {
+      version: 2,
+      name: 'observed-document-revision',
+      transaction: true,
+      up: `ALTER TABLE course_versions ADD COLUMN observed_revision BIGINT;
+           CREATE INDEX course_versions_stage_revision_idx
+             ON course_versions (stage_id, observed_revision) WHERE observed_revision IS NOT NULL;`,
+    },
+  ],
 };
 
 export async function ensureCourseVersionSchema(queryable: Queryable): Promise<void> {
@@ -84,17 +77,14 @@ const ensuredState = globalThis as typeof globalThis & {
  * schema bootstrap lock like every other lazily provisioned store. A failed
  * attempt is forgotten, so the next run retries it.
  */
-export function ensureCourseVersionStore(pool: object | null | undefined): Promise<void> {
-  if (typeof pool !== 'object' || pool === null) {
-    return Promise.reject(new Error('course versions need a database pool'));
-  }
+export function ensureCourseVersionStore(
+  pool: ConnectableQueryable | null | undefined,
+): Promise<void> {
+  if (!pool) return Promise.reject(new Error('course versions need a database pool'));
   const ensured = (ensuredState[ENSURED_KEY] ??= new WeakMap());
   const existing = ensured.get(pool);
   if (existing) return existing;
-  const attempt = withSchemaBootstrapLock(
-    pool as unknown as ConnectableQueryable,
-    ensureCourseVersionSchema,
-  ).catch((error) => {
+  const attempt = withSchemaBootstrapLock(pool, ensureCourseVersionSchema).catch((error) => {
     ensured.delete(pool);
     throw error;
   });
@@ -103,28 +93,9 @@ export function ensureCourseVersionStore(pool: object | null | undefined): Promi
 }
 
 /** One page of a version: the scene id it is stored under and its content hash. */
-export interface CourseVersionPage {
+interface CourseVersionPage {
   sceneId: string;
   hash: string;
-}
-
-/** A version as stored, without its page contents. */
-export interface CourseVersionRecord {
-  id: string;
-  stageId: string;
-  contentHash: string;
-  pages: CourseVersionPage[];
-  createdAt: number;
-}
-
-/** The document reads a snapshot or a checkout needs. */
-export interface CourseDocumentReader {
-  loadDocument(stageId: string): Promise<MaicDocument<never, never> | MaicDocument | null>;
-}
-
-/** The document writes a checkout needs: the owner-bound store's full save. */
-export interface CourseDocumentWriter extends CourseDocumentReader {
-  saveDocument(document: MaicDocument): Promise<void>;
 }
 
 export interface CourseVersionDatabase {
@@ -136,7 +107,7 @@ export interface CourseVersionDatabase {
  * JSON with object keys in code-unit order, so equal content hashes equally
  * whatever order a writer happened to build its objects in.
  */
-export function canonicalJson(value: unknown): string {
+function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== 'object') {
     return JSON.stringify(value) ?? 'null';
   }
@@ -153,18 +124,14 @@ function sha256(text: string): string {
   return createHash('sha256').update(text).digest('hex');
 }
 
-interface SceneLikeRecord {
-  id: string;
-}
-
 /** The content identity of one document: what equal versions share. */
-export function documentContentHash(document: MaicDocument): {
+function documentContentHash(document: MaicDocument): {
   contentHash: string;
   pages: CourseVersionPage[];
   pageData: Map<string, unknown>;
 } {
   const pageData = new Map<string, unknown>();
-  const pages = (document.scenes as SceneLikeRecord[]).map((scene) => {
+  const pages = document.scenes.map((scene) => {
     const hash = sha256(canonicalJson(scene));
     pageData.set(hash, scene);
     return { sceneId: scene.id, hash };
@@ -172,10 +139,7 @@ export function documentContentHash(document: MaicDocument): {
   // `updatedAt` records when the course last changed, not what it contains: a
   // checkout stamps it fresh, and two writes of the same content must still
   // hash equally.
-  const { updatedAt: _updatedAt, ...stageContent } = document.stage as unknown as Record<
-    string,
-    unknown
-  >;
+  const { updatedAt: _updatedAt, ...stageContent } = document.stage;
   const contentHash = sha256(
     canonicalJson({
       stage: stageContent,
@@ -187,14 +151,82 @@ export function documentContentHash(document: MaicDocument): {
   return { contentHash, pages, pageData };
 }
 
-/**
- * Record the course as it is now and return the version that names it.
- *
- * Returns `null` when the course does not exist (a run that has not created it
- * yet). A course whose content equals an existing version of the same course
- * returns that version rather than writing a new one, so taking a version
- * before every run costs one read and one hash when nothing changed.
- */
+/** Lock all courses and their assets in one order before a multi-course branch move. */
+export async function lockCourseVersionStages(
+  tx: Queryable,
+  ownerId: string,
+  stageIds: Iterable<string>,
+  targetVersionIds: Iterable<string>,
+): Promise<void> {
+  const ids = [...stageIds];
+  const stages = await tx.query<{ stage_id: string }>(
+    `SELECT stage_id FROM stage_meta
+      WHERE stage_id = ANY($1::text[]) AND owner_id = $2 AND deleted_at IS NULL
+      ORDER BY stage_id FOR UPDATE`,
+    [ids, ownerId],
+  );
+  // Both the document reference writer and the root writer lock asset entries.
+  // Take their union first so two courses sharing media cannot invert that order.
+  await tx.query(
+    `SELECT id FROM asset_entries WHERE id IN (
+       SELECT asset_id FROM document_asset_refs WHERE stage_id = ANY($1::text[])
+       UNION ALL
+       SELECT r.asset_id FROM asset_root_refs r JOIN course_versions v ON v.id = r.root_id
+        WHERE r.root_kind = $2 AND v.stage_id = ANY($1::text[]) AND v.id = ANY($3::text[])
+     ) ORDER BY id FOR NO KEY UPDATE`,
+    [stages.rows.map((row) => row.stage_id), COURSE_VERSION_ROOT_KIND, [...targetVersionIds]],
+  );
+}
+
+/** Ordinary reads are shared by link. A version may only belong to a live course of this owner. */
+async function lockOwnedCourse(tx: Queryable, stageId: string, ownerId: string) {
+  const result = await tx.query(
+    `SELECT 1 FROM stage_meta WHERE stage_id = $1 AND owner_id = $2 AND deleted_at IS NULL FOR UPDATE`,
+    [stageId, ownerId],
+  );
+  return result.rows.length > 0;
+}
+
+function documentsIn(tx: Queryable, ownerId: string) {
+  return createOwnerBoundDocumentStore({
+    transaction: tx,
+    ownerId,
+    validateScene: validateAppScene,
+    validateStage: validateAppStage,
+  });
+}
+
+const CURRENT_REVISION =
+  'COALESCE((SELECT rev FROM document_stage_revision WHERE stage_id = $1), 0)';
+
+/** Only the last observed database revision moves. The saved content stays immutable. */
+async function markObserved(tx: Queryable, stageId: string, versionId: string) {
+  await tx.query(
+    `UPDATE course_versions SET observed_revision = ${CURRENT_REVISION} WHERE id = $2`,
+    [stageId, versionId],
+  );
+}
+
+async function pinVersionAssets(tx: Queryable, ownerId: string, stageId: string, id: string) {
+  const principals = [...assetReferencePrincipalsForOwner(ownerId)];
+  // A retained reference belongs to another server record, not to the saved course.
+  // Legacy shared entries, like owned entries, refuse replacement while rooted.
+  const assets = await tx.query<{ id: string }>(
+    `SELECT id FROM asset_entries WHERE principal = ANY($2::text[]) AND id IN
+       (SELECT asset_id FROM document_asset_refs WHERE stage_id = $1 AND scope <> 'retained')
+       AND NOT EXISTS (SELECT 1 FROM asset_root_refs r
+                       WHERE r.root_kind = $3 AND r.root_id = $4 AND r.asset_id = asset_entries.id)
+     ORDER BY id`,
+    [stageId, principals, COURSE_VERSION_ROOT_KIND, id],
+  );
+  if (!assets.rows.length) return;
+  const assetIds = assets.rows.map((row) => row.id);
+  await changeAssetRoots(tx, {
+    add: [{ rootKind: COURSE_VERSION_ROOT_KIND, rootId: id, assetIds }],
+    principals,
+  });
+}
+
 export async function snapshotCourse(
   db: CourseVersionDatabase,
   input: {
@@ -202,57 +234,58 @@ export async function snapshotCourse(
     stageId: string;
     sessionId?: string;
     origin: CourseVersionOrigin;
-    documents: CourseDocumentReader;
-    now?: () => number;
   },
-): Promise<CourseVersionRecord | null> {
-  const document = (await input.documents.loadDocument(input.stageId)) as MaicDocument | null;
-  if (!document) return null;
-  const { contentHash, pages, pageData } = documentContentHash(document);
-  const now = input.now ?? Date.now;
-
-  const existing = await db.queryable.query<{ id: string; pages: unknown; created_at: number }>(
-    `SELECT id, pages, created_at FROM course_versions
-      WHERE stage_id = $1 AND content_hash = $2
-      ORDER BY created_at ASC LIMIT 1`,
-    [input.stageId, contentHash],
-  );
-  if (existing.rows[0]) {
-    return {
-      id: existing.rows[0].id,
-      stageId: input.stageId,
-      contentHash,
-      pages: existing.rows[0].pages as CourseVersionPage[],
-      createdAt: Number(existing.rows[0].created_at),
-    };
-  }
-
-  const id = `cv_${randomUUID()}`;
-  const createdAt = now();
-  await db.withTransaction(async (tx) => {
-    // The owner the version is for after any claim moved the course: the
-    // background fence follows the claim forward, as the run's own store does.
+): Promise<{ id: string } | null> {
+  const { stageId } = input;
+  return db.withTransaction(async (tx) => {
     const ownerId = await forwardOwnerWrite(tx, input.ownerId);
-    for (const [hash, data] of pageData) {
-      await tx.query(
-        `INSERT INTO course_version_pages (content_hash, data, created_at)
-         VALUES ($1, $2::jsonb, $3)
-         ON CONFLICT (content_hash) DO NOTHING`,
-        [hash, JSON.stringify(data), createdAt],
-      );
+    if (!(await lockOwnedCourse(tx, stageId, ownerId))) return null;
+
+    // This statement starts after the lock wait, so it sees the last writer's commit.
+    const seen = await tx.query<{ id: string }>(
+      `SELECT id FROM course_versions WHERE stage_id = $1 AND observed_revision = ${CURRENT_REVISION}
+       ORDER BY created_at, id LIMIT 1`,
+      [stageId],
+    );
+    if (seen.rows[0]) return seen.rows[0];
+    const document = await documentsIn(tx, ownerId).loadDocument(stageId);
+    if (!document) return null;
+
+    const { contentHash, pages, pageData } = documentContentHash(document);
+    const existing = await tx.query<{ id: string }>(
+      // v1 hashes used null for an absent outline. The row retains which it was.
+      `SELECT id FROM course_versions WHERE stage_id = $1 AND content_hash = $2
+        AND (outline IS NULL) = $3 ORDER BY created_at, id LIMIT 1`,
+      [stageId, contentHash, document.outline === undefined],
+    );
+    if (existing.rows[0]) {
+      const { id } = existing.rows[0];
+      // A later save may have resolved an asset the identical draft once lacked.
+      await pinVersionAssets(tx, ownerId, stageId, id);
+      await markObserved(tx, stageId, id);
+      return { id };
     }
+
+    const id = `cv_${randomUUID()}`;
+    const createdAt = Date.now();
+    await tx.query(
+      `INSERT INTO course_version_pages (content_hash, data, created_at)
+       SELECT key, value, $2 FROM jsonb_each($1::jsonb) ORDER BY key
+       ON CONFLICT DO NOTHING`,
+      [JSON.stringify(Object.fromEntries(pageData)), createdAt],
+    );
     await tx.query(
       `INSERT INTO course_versions
-         (id, stage_id, owner_id, content_hash, stage, outline, dsl_version, pages,
-          session_id, origin, created_at)
-       VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8::jsonb, $9, $10, $11)`,
+         (stage_id, id, owner_id, content_hash, stage, outline, dsl_version, pages,
+          session_id, origin, created_at, observed_revision)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8::jsonb, $9, $10, $11, ${CURRENT_REVISION})`,
       [
+        stageId,
         id,
-        input.stageId,
         ownerId,
         contentHash,
         JSON.stringify(document.stage),
-        document.outline === undefined ? null : JSON.stringify(document.outline),
+        JSON.stringify(document.outline),
         document.dslVersion ?? null,
         JSON.stringify(pages),
         input.sessionId ?? null,
@@ -260,139 +293,92 @@ export async function snapshotCourse(
         createdAt,
       ],
     );
-    await pinVersionAssets(tx, { versionId: id, stageId: input.stageId, ownerId });
-  });
-  return { id, stageId: input.stageId, contentHash, pages, createdAt };
-}
-
-/**
- * Hold every asset the course names right now under the version's root.
- *
- * The live document is the version's content at this moment, and the document
- * store keeps `document_asset_refs` in step with it, so its rows are exactly
- * the entries the version names -- by the store's own reference rules, with no
- * second heuristic. Only entries in the owner's own partition can be rooted
- * (the asset layer refuses anything else); entries in the legacy shared
- * partition are left to the document references that already hold them.
- */
-async function pinVersionAssets(
-  tx: Queryable,
-  input: { versionId: string; stageId: string; ownerId: string },
-): Promise<void> {
-  const principal = assetPrincipalForOwner(input.ownerId).key;
-  const owned = await tx.query<{ id: string }>(
-    `SELECT e.id
-       FROM asset_entries e
-      WHERE e.principal = $2
-        AND e.id IN (SELECT DISTINCT asset_id FROM document_asset_refs WHERE stage_id = $1)
-      ORDER BY e.id`,
-    [input.stageId, principal],
-  );
-  const assetIds = owned.rows.map((row) => row.id);
-  if (assetIds.length === 0) return;
-  await changeAssetRoots(tx, {
-    add: [{ rootKind: COURSE_VERSION_ROOT_KIND, rootId: input.versionId, assetIds }],
-    principals: [principal],
+    await pinVersionAssets(tx, ownerId, stageId, id);
+    return { id };
   });
 }
 
-/** A stored version with its page contents, ready to be written back. */
-export async function loadCourseVersion(
-  queryable: Queryable,
-  versionId: string,
-): Promise<{ record: CourseVersionRecord; document: MaicDocument } | null> {
-  const result = await queryable.query<{
-    id: string;
-    stage_id: string;
-    content_hash: string;
-    stage: unknown;
-    outline: unknown;
-    dsl_version: string | null;
-    pages: unknown;
-    created_at: number;
-  }>(
-    `SELECT id, stage_id, content_hash, stage, outline, dsl_version, pages, created_at
-       FROM course_versions WHERE id = $1`,
-    [versionId],
-  );
-  const row = result.rows[0];
-  if (!row) return null;
-  const pages = row.pages as CourseVersionPage[];
-  const hashes = [...new Set(pages.map((page) => page.hash))];
-  const stored = await queryable.query<{ content_hash: string; data: unknown }>(
-    `SELECT content_hash, data FROM course_version_pages WHERE content_hash = ANY($1::text[])`,
-    [hashes],
-  );
-  const byHash = new Map(stored.rows.map((page) => [page.content_hash, page.data]));
-  const scenes = pages.map((page) => {
-    const data = byHash.get(page.hash);
-    if (data === undefined) {
-      throw new Error(`course version ${versionId} is missing page ${page.hash}`);
-    }
-    return data;
-  });
-  const document: MaicDocument = {
-    stage: row.stage as MaicDocument['stage'],
-    scenes: scenes as MaicDocument['scenes'],
-    ...(row.outline === null || row.outline === undefined ? {} : { outline: row.outline }),
-    ...(row.dsl_version ? { dslVersion: row.dsl_version } : {}),
-  };
-  return {
-    record: {
-      id: row.id,
-      stageId: row.stage_id,
-      contentHash: row.content_hash,
-      pages,
-      createdAt: Number(row.created_at),
-    },
-    document,
-  };
-}
-
-/**
- * `missing`: nothing was written, because the version is gone or the course
- * was deleted since. A branch switch never brings a deleted course back.
- */
 export type CheckoutOutcome = 'unchanged' | 'restored' | 'missing';
 
-/**
- * Write a version back over the live course.
- *
- * Goes through the caller's owner-bound document store, so the write is the
- * same owner-checked, reference-tracked, revision-bumping save an agent tool
- * makes, and the canvas refreshes through its ordinary freshness sync. A live
- * course whose content already equals the version is left alone, and so is a
- * course that no longer exists.
- */
 export async function checkoutCourseVersion(
   db: CourseVersionDatabase,
-  input: { versionId: string; stageId: string; documents: CourseDocumentWriter },
+  input: { versionId: string; stageId: string; ownerId: string },
 ): Promise<CheckoutOutcome> {
-  const loaded = await loadCourseVersion(db.queryable, input.versionId);
-  if (!loaded || loaded.record.stageId !== input.stageId) return 'missing';
-  const live = (await input.documents.loadDocument(input.stageId)) as MaicDocument | null;
-  if (!live) return 'missing';
-  if (documentContentHash(live).contentHash === loaded.record.contentHash) return 'unchanged';
-  // Restoring is a change to the course: it is stamped as one, so course lists
-  // order it by now rather than by when the version was first taken.
-  await input.documents.saveDocument({
-    ...loaded.document,
-    stage: { ...loaded.document.stage, updatedAt: Date.now() },
-  });
-  return 'restored';
-}
+  const { stageId, versionId } = input;
+  return db.withTransaction(async (tx) => {
+    const ownerId = await forwardOwnerWrite(tx, input.ownerId);
+    if (!(await lockOwnedCourse(tx, stageId, ownerId))) return 'missing';
 
-/** Whether the live course still has the content of a version. */
-export async function liveMatchesVersion(
-  db: CourseVersionDatabase,
-  input: { versionId: string; stageId: string; documents: CourseDocumentReader },
-): Promise<boolean> {
-  const live = (await input.documents.loadDocument(input.stageId)) as MaicDocument | null;
-  if (!live) return false;
-  const result = await db.queryable.query<{ content_hash: string }>(
-    'SELECT content_hash FROM course_versions WHERE id = $1 AND stage_id = $2',
-    [input.versionId, input.stageId],
-  );
-  const row = result.rows[0];
-  return row !== undefined && row.content_hash === documentContentHash(live).contentHash;
+    const result = await tx.query<{
+      stage: MaicDocument['stage'];
+      outline: unknown;
+      has_outline: boolean;
+      dsl_version: string | null;
+      matches_revision: boolean | null;
+      current_dsl: boolean | null;
+      stage_changed: boolean;
+      outline_changed: boolean;
+    }>(
+      `SELECT v.stage, v.outline, v.outline IS NOT NULL AS has_outline, v.dsl_version,
+              v.observed_revision = ${CURRENT_REVISION} AS matches_revision,
+              (s.data->>'dslVersion' = $3 AND v.dsl_version = $3) AS current_dsl,
+              (s.data - 'dslVersion' - 'updatedAt') IS DISTINCT FROM (v.stage - 'updatedAt') AS stage_changed,
+              o.data IS DISTINCT FROM v.outline AS outline_changed
+         FROM course_versions v JOIN document_stages s ON s.id = v.stage_id
+         LEFT JOIN document_outlines o ON o.stage_id = s.id
+        WHERE v.stage_id = $1 AND v.id = $2`,
+      [stageId, versionId, DSL_VERSION],
+    );
+    const version = result.rows[0];
+    if (!version || version.stage.id !== stageId)
+      throw new Error(`Missing version ${versionId} of course ${stageId}`);
+    if (version.matches_revision) return 'unchanged';
+
+    // For a current document, let jsonb compare each live row with its saved page.
+    // Only changed rows cross the connection or bump the canvas's scene revision.
+    const pages = await tx.query<{
+      id: string;
+      in_version: boolean;
+      data: MaicDocument['scenes'][number] | null;
+    }>(
+      `WITH target AS (
+         SELECT page->>'sceneId' AS id, saved.data
+           FROM jsonb_array_elements((SELECT pages FROM course_versions WHERE id = $2)) page
+           LEFT JOIN course_version_pages saved ON saved.content_hash = page->>'hash'
+       ), live AS (SELECT id, data FROM document_scenes WHERE stage_id = $1)
+       SELECT COALESCE(target.id, live.id) AS id, target.id IS NOT NULL AS in_version, target.data
+         FROM target FULL JOIN live USING (id)
+        WHERE NOT $3::boolean OR target.data IS NULL OR target.data IS DISTINCT FROM live.data
+        ORDER BY id`,
+      [stageId, versionId, version.current_dsl === true],
+    );
+    const changed = [];
+    const removed = [];
+    for (const page of pages.rows) {
+      if (!page.in_version) removed.push(page.id);
+      else if (page.data) changed.push(page.data);
+      else throw new Error(`Missing page ${page.id} of course version ${versionId}`);
+    }
+    const changedDocument =
+      !version.current_dsl ||
+      pages.rows.length > 0 ||
+      version.stage_changed ||
+      version.outline_changed;
+    if (changedDocument) {
+      await documentsIn(tx, ownerId).restoreDocument(
+        {
+          stage: { ...version.stage, updatedAt: Date.now() },
+          scenes: changed.sort((a, b) => a.order - b.order),
+          ...(version.has_outline ? { outline: version.outline } : {}),
+          ...(version.dsl_version ? { dslVersion: version.dsl_version } : {}),
+        },
+        version.current_dsl
+          ? { removedSceneIds: removed, outlineChanged: version.outline_changed }
+          : undefined,
+      );
+    }
+    await pinVersionAssets(tx, ownerId, stageId, versionId);
+    await markObserved(tx, stageId, versionId);
+    return changedDocument ? 'restored' : 'unchanged';
+  });
 }

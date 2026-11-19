@@ -260,7 +260,7 @@ export interface TimelineBranch {
   /** A branch request is on its way: every control waits for it. */
   disabled: boolean;
   /** Send `text` as a new version of user message `userSeq`; resolves whether it was accepted. */
-  onEdit: (userSeq: number, text: string, node: ChatNode) => Promise<boolean>;
+  onEdit: (userSeq: number, text: string) => Promise<boolean>;
   onRegenerate: (userSeq: number) => void;
   onSwitchUser: (userSeq: number) => void;
   onSwitchReply: (userSeq: number, variant: number | 'orig') => void;
@@ -333,7 +333,7 @@ export function ChatTimeline({
           hasAttachments={Boolean(node.materials?.length)}
           onCancel={() => setEditingKey(null)}
           onSubmit={async (text) => {
-            const accepted = await branch.onEdit(userSeq, text, node);
+            const accepted = await branch.onEdit(userSeq, text);
             if (accepted) setEditingKey(null);
             return accepted;
           }}
@@ -348,7 +348,7 @@ export function ChatTimeline({
           fork={fork}
           // The opening prompt starts the session; the prototype edits follow-ups only.
           // A run still writing is no reason to hide it: the request stops the run first.
-          editable={userSeq > 0}
+          editable={userSeq > 0 && branch.segments[segment.parent ?? '']?.kind !== 'root'}
           disabled={branch.disabled}
           onEdit={() => setEditingKey(node.key)}
           onSelect={(index) => {
@@ -392,7 +392,16 @@ export function ChatTimeline({
     rendered.push(renderRow(row, index));
     const segmentId = segmentOfRow(row);
     const nextSegment = index + 1 < rows.length ? segmentOfRow(rows[index + 1]!) : undefined;
-    if (segmentId && segmentId !== nextSegment) rendered.push(replyControls(segmentId));
+    if (!segmentId || segmentId === nextSegment) return;
+    const segment = branch?.segments[segmentId];
+    if (segment?.kind === 'user' && segment.selected && segment.selected !== nextSegment) {
+      // A completed reply can have only hidden tools, or no visible content.
+      // Its user row still owns the way back to the other versions.
+      if (branch?.segments[segment.selected]?.endStatus)
+        rendered.push(replyControls(segment.selected));
+    } else {
+      rendered.push(replyControls(segmentId));
+    }
   });
 
   function renderRow(row: ChatRow, index: number): ReactNode {

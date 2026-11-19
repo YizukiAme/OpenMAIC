@@ -5,6 +5,7 @@
  * claims, lease generations, event ordering, cancellation, and conversation
  * recovery. A client connection is never part of the execution lifetime.
  */
+import { isPBLRoleSession } from '@/lib/pbl/v3/session-kind';
 import { ModelAuthorizationError } from '@/lib/server/model-config/model-authorization';
 import {
   assertRuntimeSchemaCompatibility,
@@ -102,12 +103,12 @@ import {
   withToolCallIntegrityRepair,
   type PendingToolCall,
 } from './tool-call-integrity';
-import { getAgentSessionStore, withAgentSessionClaim } from './store';
+import { agentSessionStoreIn, getAgentSessionStore, withAgentSessionClaim } from './store';
 import { findDeletedUserSkill } from './user-skills';
 import { listAgentUserMessages, readAgentMessageLog } from './user-messages';
 import { subscribeAgentEventWakeup } from './event-notify-bus';
 import { getBackgroundDocumentStore } from './owner-scoped-documents';
-import { canonicalizeStoredOwner } from '@/lib/persistence/owner-merges';
+import { canonicalizeStoredOwner, forwardOwnerWrite } from '@/lib/persistence/owner-merges';
 import {
   courseGenerationNotice,
   listCourseGenerations,
@@ -124,18 +125,18 @@ import {
 import type { Queryable } from '@openmaic/storage/document/pg';
 import { getServerPersistenceProvider } from '@/lib/persistence/server-provider';
 import { listPendingMediaTasks } from './pending-media';
-import {
-  ensureCourseVersionStore,
-  type CourseDocumentWriter,
-} from '@/lib/server/course-versions/store';
+import { ensureCourseVersionStore } from '@/lib/server/course-versions/store';
 import {
   applyBranchRequests,
-  readPendingBranchRequests,
   recordCourseVersions,
   type ApplyBranchResult,
   type CourseVersionDeps,
 } from '@/lib/server/course-versions/branching';
-import type { CourseVersionsEntryData } from '@/lib/server/course-versions/tree';
+import {
+  COURSE_VERSIONS_ENTRY,
+  REPLY_VARIANT_ENTRY,
+  type CourseVersionsEntryData,
+} from '@/lib/server/course-versions/tree';
 
 const log = createLogger('AgentRunner');
 const PROCESS_WORKER_ID = `${randomUUID().slice(0, 8)}:${process.pid}`;
@@ -1188,8 +1189,7 @@ async function executeSession(
     return entrySession;
   };
   const loadEntryHistory = async (): Promise<SessionEntryHistory> => {
-    await openEntrySession();
-    return loadSessionEntryHistory(entrySession!, {
+    return loadSessionEntryHistory(await openEntrySession(), {
       sessionId: id,
       priorRuns: () => readPriorRunRecord(store, id),
     });
@@ -1231,6 +1231,7 @@ async function executeSession(
   const trackThinking = meta.id.startsWith('pbl-role-') ? createThinkingTimingTracker() : undefined;
 
   const appendEvent = (type: string, data: unknown, ts: number): void => {
+    const branchReceipt = Array.isArray((data as { branches?: unknown } | null)?.branches);
     const snapshot = snapshotEventDataForLog(type, data, meta.id.startsWith('pbl-role-'));
     enqueue(async () => {
       const seq = await store.appendRunEvent(id, WORKER_ID, {
@@ -1252,7 +1253,7 @@ async function executeSession(
           log.error(`session ${id}: message update prune failed`, error);
         }
       }
-    });
+    }, branchReceipt);
   };
 
   const emit = (type: string, data: unknown): void => {
@@ -1347,7 +1348,7 @@ async function executeSession(
   /** Every terminal exit checks whether a durable message lacked a consumer. */
   const requeueIfUndelivered = async (why: string, atVerdict = false): Promise<void> => {
     try {
-      const logged = await listAgentUserMessages(store, id);
+      const { messages: logged, pendingBranches } = await readAgentMessageLog(store, id);
       const current = await store.getSession(id);
       const deliveredThrough = current?.deliveredUserMessageSeq ?? 0;
       const action = planUndeliveredRequeue({ logged, deliveredThrough, claimSeq, atVerdict });
@@ -1356,7 +1357,10 @@ async function executeSession(
         log.info(
           `session ${id}: ${undelivered} fresh undelivered message(s) at ${why}; requeued with attempt reset`,
         );
-      } else if (action === 'retry' && (await store.requeueForRetry(id))) {
+      } else if (
+        (action === 'retry' || (!atVerdict && pendingBranches?.length)) &&
+        (await store.requeueForRetry(id))
+      ) {
         log.info(
           `session ${id}: ${undelivered} stranded message(s) at ${why}; requeued preserving attempt`,
         );
@@ -1448,7 +1452,7 @@ async function executeSession(
 
   // Course versions (#1317): what the run reads and writes to keep each branch
   // of the conversation on its own course. Built lazily: a session that never
-  // branches pays one hash per run boundary and nothing else.
+  // branches normally sees the same document revision and skips reading pages.
   let courseVersionDeps: CourseVersionDeps | undefined;
   const getCourseVersionDeps = async (): Promise<CourseVersionDeps> => {
     if (courseVersionDeps) return courseVersionDeps;
@@ -1461,9 +1465,6 @@ async function executeSession(
       defaultStageId: meta.stageId,
       session,
       writeEntry: (write) => writeRequiredSessionEntry(write, markLeaseLost),
-      documents: (await getBackgroundDocumentStore(meta.ownerId, async (transaction) => {
-        await store.assertActiveLease(id, WORKER_ID, attempt, transaction);
-      })) as unknown as CourseDocumentWriter,
       db: {
         queryable: provider.pool as unknown as Queryable,
         withTransaction: provider.withTransaction,
@@ -1473,59 +1474,129 @@ async function executeSession(
   };
   // Courses this run wrote, from the tools' checkpoint receipts.
   const touchedStageIds = new Set<string>();
+  const referencedStages = new Map<number, string[]>();
+  const rememberStageRefs = (message: FollowUpMessage) => {
+    const ids = [...(message.courseRefs ?? []), ...(message.elementRefs ?? [])].map(
+      (ref) => ref.stageId,
+    );
+    if (ids.length && message.durableMessageSeq !== undefined)
+      referencedStages.set(message.durableMessageSeq, ids);
+  };
   const onStageCheckpoint = (info: unknown): void => {
     const stageId = (info as { stageId?: unknown } | null)?.stageId;
     if (typeof stageId === 'string' && stageId) touchedStageIds.add(stageId);
     emit(LIFECYCLE.checkpoint, info);
   };
-  // Record the courses at a run boundary. Best effort: a version that cannot
-  // be taken leaves the branch on its previous one, and the run goes on.
+  // A failed snapshot leaves an explicit gap. Ordinary conversation can
+  // continue, but a branch cannot silently use an earlier course as its input.
   const recordRunBoundary = async (
     phase: 'before_run' | 'after_run',
     status?: string,
+    messageSeq?: number,
   ): Promise<CourseVersionsEntryData['versions']> => {
     if (leaseLost || id.startsWith('pbl-role-')) return [];
     try {
       return await recordCourseVersions(await getCourseVersionDeps(), {
         phase,
         ...(status ? { status } : {}),
-        extraStageIds: touchedStageIds,
+        extraStageIds: [
+          ...touchedStageIds,
+          ...(messageSeq === undefined ? [] : (referencedStages.get(messageSeq) ?? [])),
+        ],
       });
     } catch (error) {
       log.warn(`session ${id}: course versions (${phase}) not recorded`, error);
+      await writeRequiredSessionEntry(async () => {
+        const session = await openEntrySession();
+        await session.appendCustomEntry(COURSE_VERSIONS_ENTRY, {
+          phase,
+          versions: [],
+          unavailable: true,
+        });
+      }, markLeaseLost);
       return [];
     }
   };
 
+  let branchReceipt: { branches?: ApplyBranchResult['outcomes'] } = {};
   try {
-    // Branch requests (#1317) move the conversation before the run is planned,
-    // so planning sees the branch the user asked for.
+    const {
+      messages: loggedMessages,
+      detachedSkills,
+      openingMessageSeq,
+      pendingBranches = [],
+      branchOnlyEnd,
+      createdStageIds,
+    } = await readAgentMessageLog(store, id);
     let branching: ApplyBranchResult = { outcomes: [], regenerated: false };
-    if (!id.startsWith('pbl-role-')) {
-      // Reading is best effort: when it fails the requests stay pending and
-      // the next claim applies them; the run itself goes on as before.
-      const pendingBranches = await getServerPersistenceProvider(process.env.DATABASE_URL ?? '')
-        .then((provider) => readPendingBranchRequests(provider.pool as unknown as Queryable, id))
-        .catch((error: unknown) => {
-          log.warn(`session ${id}: branch requests not read`, error);
-          return [];
-        });
-      if (pendingBranches.length > 0) {
-        branching = await applyBranchRequests(
-          {
-            ...(await getCourseVersionDeps()),
-            hasPendingMedia: () =>
-              listPendingMediaTasks().some(
-                (task) => task.sessionId === id && task.status === 'generating',
-              ),
-          },
-          pendingBranches,
-        );
-        await flushAll();
-        if (leaseLost) throw new AgentSessionLeaseLostError(id, WORKER_ID, attempt);
+    if (pendingBranches.length && !isPBLRoleSession(id)) {
+      const provider = await getServerPersistenceProvider(process.env.DATABASE_URL ?? '');
+      await ensureCourseVersionStore(provider.pool);
+      branching = await applyBranchRequests(
+        {
+          createdStageIds,
+          withTransaction: (apply) =>
+            provider.withTransaction(async (tx) => {
+              const ownerId = await forwardOwnerWrite(tx, meta.ownerId);
+              const pinned = agentSessionStoreIn(tx);
+              await pinned.assertActiveLease(id, WORKER_ID, attempt, tx);
+              const handle = await pinned.openEntryTree(id, WORKER_ID, attempt);
+              return apply({
+                sessionId: id,
+                ownerId,
+                defaultStageId: meta.stageId,
+                session: new Session(AgentSessionEntryStorage.fromHandle(meta, handle)),
+                writeEntry: (write) => write(),
+                db: { queryable: tx, withTransaction: (body) => body(tx) },
+              });
+            }),
+          hasPendingMedia: () =>
+            listPendingMediaTasks().some(
+              (task) => task.sessionId === id && task.status === 'generating',
+            ),
+        },
+        pendingBranches.map((request) =>
+          request.data?.op === 'edit' && !request.editMessage
+            ? { ...request, data: null }
+            : request,
+        ),
+      );
+      branchReceipt = { branches: branching.outcomes };
+      for (const request of pendingBranches) {
+        if (
+          request.editMessage &&
+          branching.outcomes.some(
+            (outcome) => outcome.requestSeq === request.seq && outcome.status === 'applied',
+          )
+        ) {
+          loggedMessages.push(request.editMessage);
+        }
       }
+      loggedMessages.sort((a, b) => a.seq - b.seq);
     }
-    const branchReceipt = branching.outcomes.length > 0 ? { branches: branching.outcomes } : {};
+    let deliveredThrough = meta.deliveredUserMessageSeq ?? 0;
+
+    // Looking at a branch must never resume, truncate or repair its transcript,
+    // including a takeover between the switch-only receipt and finishSession.
+    if (
+      (branching.outcomes.length || branchOnlyEnd) &&
+      !branching.regenerated &&
+      !loggedMessages.some((message) => message.seq > deliveredThrough)
+    ) {
+      emit(LIFECYCLE.sessionEnd, {
+        status: 'succeeded',
+        note: 'branch requests only',
+        ...branchReceipt,
+      });
+      await flushAll();
+      const settled = await store.finishSession(id, WORKER_ID, {
+        status: 'succeeded',
+        resetAttempt: true,
+        expectedAttempt: attempt,
+      });
+      if (settled) await requeueIfUndelivered('branch requests');
+      return;
+    }
 
     const recovery = await loadEntryHistory();
     const historyMessages = recovery.messages;
@@ -1536,6 +1607,35 @@ async function executeSession(
       (latest, message) => Math.max(latest, durableUserMessageSeq(message) ?? 0),
       0,
     );
+    // Delivery is monotonic across the whole conversation. After a switch
+    // or a restart on a regenerated reply, only the raw selected path names
+    // the turn whose language and Skill should be in effect.
+    const branched =
+      branching.regenerated ||
+      loggedMessages.some((message) => message.branchEdit) ||
+      recovery.branch.some(
+        (entry) =>
+          entry.type === 'custom' &&
+          (entry.customType === REPLY_VARIANT_ENTRY ||
+            (entry.customType === COURSE_VERSIONS_ENTRY &&
+              (entry.data as CourseVersionsEntryData)?.requestSeq !== undefined)),
+      );
+    const branchSeqs = branched
+      ? recovery.cursorMessages.map(durableUserMessageSeq).filter((seq) => seq !== null)
+      : [];
+    const selectedSeqs = new Set(branchSeqs);
+    const resumedSeq = branched
+      ? (branchSeqs.at(-1) ?? 0)
+      : Math.max(deliveredThrough, consumedInTranscript);
+    // A crash between appending the edited user frame and advancing the
+    // delivery cursor leaves the transcript authoritative. Repair the cursor
+    // before either startup or the wakeup drain can deliver that frame again.
+    if (branched && resumedSeq > deliveredThrough) {
+      if (!(await store.markUserMessageDelivered(id, WORKER_ID, attempt, resumedSeq))) {
+        throw new AgentSessionLeaseLostError(id, WORKER_ID, attempt);
+      }
+      deliveredThrough = resumedSeq;
+    }
     // planResume now contains durable messages only; synthetic receipts are a
     // read-time provider view owned by repairOrphanedToolCalls.
     const retainedCount = plannedMessages.length;
@@ -1597,12 +1697,6 @@ async function executeSession(
     if (deletedSkill)
       installedSkills = installedSkills.filter((skill) => skill.id !== deletedSkill.id);
 
-    const {
-      messages: loggedMessages,
-      detachedSkills,
-      openingMessageSeq,
-    } = await readAgentMessageLog(store, id);
-    let deliveredThrough = meta.deliveredUserMessageSeq ?? 0;
     // Each durable message's interface language (#1880), filled as the run
     // reads messages; `localeThrough` decides which one is in effect.
     const messageLocales = new Map<number, Locale>();
@@ -1610,7 +1704,10 @@ async function executeSession(
       const locale = supportedLocaleOf(message.locale);
       if (locale) messageLocales.set(message.seq, locale);
     };
-    loggedMessages.forEach(rememberLocale);
+    for (const message of loggedMessages) {
+      if (!branched || selectedSeqs.has(message.seq) || message.seq > deliveredThrough)
+        rememberLocale(message);
+    }
     // Resolve the classrooms each pending message named against the owner's
     // library BEFORE the prompt is built: the run must be told the course's
     // current name (reference semantics), and the same resolved refs feed the
@@ -1620,29 +1717,8 @@ async function executeSession(
         .filter((message) => message.seq > deliveredThrough)
         .map((message) => resolveCourseRefContext(meta.ownerId, toFollowUp(message))),
     );
+    pending.forEach(rememberStageRefs);
     const idleAttach = meta.existingCourse;
-
-    // A claim made for branch requests has a run to make only when a
-    // regenerate moved onto a message to answer again, or a message is waiting
-    // (an edit's). Otherwise it settles here, even when the branch it ends on
-    // stopped mid-reply: an interrupted branch resumes when the user sends a
-    // message on it, never because they looked at it or a request on it was
-    // turned down.
-    if (branching.outcomes.length > 0 && !branching.regenerated && pending.length === 0) {
-      emit(LIFECYCLE.sessionEnd, {
-        status: 'succeeded',
-        note: 'branch requests only',
-        ...branchReceipt,
-      });
-      await flushAll();
-      const settled = await store.finishSession(id, WORKER_ID, {
-        status: 'succeeded',
-        resetAttempt: true,
-        expectedAttempt: attempt,
-      });
-      if (settled) await requeueIfUndelivered('branch requests');
-      return;
-    }
 
     if (
       ((plan.kind === 'already-complete' && !teaching?.needsTurnReceipt()) ||
@@ -1693,6 +1769,11 @@ async function executeSession(
         repairedToolCalls: repairedToolCallIds,
         ...branchReceipt,
       });
+    }
+
+    if (branchReceipt.branches) {
+      await flushAll();
+      if (leaseLost) throw new AgentSessionLeaseLostError(id, WORKER_ID, attempt);
     }
 
     if (deletedSkill) {
@@ -1816,20 +1897,22 @@ async function executeSession(
     };
     const resolvedPending = await Promise.all(pending.map(resolveFollowUpElementContext));
     pending.splice(0, pending.length, ...resolvedPending);
-    const plannedStart = planRunStart({
-      plan,
-      claimReason: meta.claimReason,
-      pending,
-      prompt: meta.prompt,
-      idleAttach,
-      firstRunSeq: recovery.firstRunSeq,
-    });
+    const plannedStart: RunStart = branching.regenerated
+      ? { kind: 'continue' }
+      : planRunStart({
+          plan,
+          claimReason: loggedMessages.find((message) => message.seq > deliveredThrough)?.branchEdit
+            ? 'queued'
+            : meta.claimReason,
+          pending,
+          prompt: meta.prompt,
+          idleAttach,
+          firstRunSeq: recovery.firstRunSeq,
+        });
     // Discovery, preload and both readers share the consumed turn's boundary.
     // Queuing a steer must not change what the preceding turn may read.
     let skillMessageSeq =
-      plannedStart.kind === 'prompt'
-        ? (plannedStart.durableMessageSeq ?? 0)
-        : Math.max(deliveredThrough, consumedInTranscript);
+      plannedStart.kind === 'prompt' ? (plannedStart.durableMessageSeq ?? 0) : resumedSeq;
     const currentSkills = () => skillsForMessage(skillMessageSeq);
     // Activation is a fact of the raw append-only branch: compaction may have
     // summarized the skill `read` away from the model view, but the session is
@@ -1858,7 +1941,7 @@ async function executeSession(
       messageLocales,
       plannedStart.kind === 'prompt' && plannedStart.durableMessageSeq !== undefined
         ? plannedStart.durableMessageSeq
-        : Math.max(deliveredThrough, consumedInTranscript),
+        : resumedSeq,
       meta.locale,
     );
     const execution = teaching
@@ -1928,7 +2011,10 @@ async function executeSession(
             sessionId: id,
             stageAccess,
             onStageLink: (course) => emit(LIFECYCLE.stageLink, course),
-            onLibraryChanged: (change) => emit(LIFECYCLE.libraryChanged, change),
+            onLibraryChanged: (change) => {
+              if (change.change === 'stage_created') touchedStageIds.add(change.stageId);
+              emit(LIFECYCLE.libraryChanged, change);
+            },
             onCheckpoint: onStageCheckpoint,
             courseGenerations,
           });
@@ -2274,8 +2360,14 @@ async function executeSession(
           }
         }
         enqueue(async () => {
-          await entrySession!.appendMessage(event.message);
           const deliveredSeq = durableUserMessageSeq(event.message);
+          if (
+            deliveredSeq !== null &&
+            (plannedStart.kind !== 'prompt' || deliveredSeq !== plannedStart.durableMessageSeq)
+          ) {
+            await recordRunBoundary('before_run', undefined, deliveredSeq);
+          }
+          await entrySession!.appendMessage(event.message);
           if (deliveredSeq !== null) {
             const marked = await store.markUserMessageDelivered(
               id,
@@ -2340,6 +2432,7 @@ async function executeSession(
         // Recorded now, in effect only once pi consumes the message.
         rememberLocale(message);
         const followUp = toFollowUp(message);
+        rememberStageRefs(followUp);
         // Same resolution as the start path: a steered message names its
         // classrooms on the durable event, and the model must be told the
         // course's current name, not the pick-time snapshot.
@@ -2418,7 +2511,7 @@ async function executeSession(
         // hand edits included, recorded on the path right above the user
         // frame. Editing or regenerating this message later starts from here.
         await flushAll();
-        await recordRunBoundary('before_run');
+        await recordRunBoundary('before_run', undefined, plannedStart.durableMessageSeq);
         // ── Forced skill loading ─────────────────────────────────────────────
         //
         // A skill the user chose must be LOADED, not merely hinted at, and ONE
@@ -2499,10 +2592,9 @@ async function executeSession(
         // A regenerate (#1317) answers the last user message ON THIS BRANCH,
         // which the delivery cursor alone cannot name: messages delivered on
         // another branch since are newer. The branch's own transcript can.
-        const resumedThrough = branching.regenerated
-          ? consumedInTranscript
-          : Math.max(deliveredThrough, consumedInTranscript);
-        const resumedMessage = loggedMessages.findLast((message) => message.seq <= resumedThrough);
+        const resumedMessage = loggedMessages.findLast((message) =>
+          branched ? message.seq === resumedSeq : message.seq <= resumedSeq,
+        );
         const resumedTurnText = resumedMessage?.text ?? meta.prompt;
         const repair = await buildSkillPreload({
           text: resumedTurnText,
@@ -2646,8 +2738,11 @@ async function executeSession(
         if (!leaseLost) await store.releaseLease(id, WORKER_ID);
       } else {
         if (!terminalFrameEmitted) {
+          await flushAll(false);
+          const courseVersions = await recordRunBoundary('after_run', 'failed');
           emit(LIFECYCLE.sessionEnd, {
             status: 'failed',
+            ...(courseVersions.length ? { courseVersions } : {}),
             error: message,
             ...(error instanceof ModelAuthorizationError
               ? { errorCode: error.code, statusCode: error.httpStatus }
@@ -2688,6 +2783,7 @@ async function executeSession(
       if (!terminalFrameEmitted) {
         emit(LIFECYCLE.sessionEnd, {
           status: 'failed',
+          ...(!runEventEmitted ? branchReceipt : {}),
           error: message,
           ...(error instanceof ModelAuthorizationError
             ? { errorCode: error.code, statusCode: error.httpStatus }

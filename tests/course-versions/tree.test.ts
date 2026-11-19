@@ -144,6 +144,16 @@ describe('planning a branch move', () => {
     });
   });
 
+  it('also refuses the durable opener when a before-run course version precedes it', () => {
+    const attached = [versions('before', null, [['stage', 'v1']]), user('opener', 'before', 1)];
+    for (const targetSeq of [0, 1]) {
+      expect(planBranchMove(attached, { op: 'edit', targetSeq }, 3)).toEqual({
+        kind: 'reject',
+        reason: 'opening_message_not_editable',
+      });
+    }
+  });
+
   it('switches to a message or to one of its replies', () => {
     expect(planBranchMove(tree, { op: 'switch', targetSeq: 7 }, 44)).toEqual({
       kind: 'move',
@@ -160,6 +170,21 @@ describe('planning a branch move', () => {
     expect(planBranchMove(tree, { op: 'switch', targetSeq: 7, variant: 9 }, 47)).toEqual({
       kind: 'reject',
       reason: 'variant_not_found',
+    });
+  });
+
+  it('returns to the reply last selected inside a nested fork', () => {
+    // Of message 7's replies, the older original was selected before the
+    // user moved to edited message 30. Its departure snapshot remembers that.
+    const nested = [
+      ...tree,
+      versions('depart-original', 'v3', [['stage', 'cv-original-hand-edit']]),
+      leaf('to-edited', 'depart-original', 'a3e'),
+      versions('depart-edited', 'a3e', [['stage', 'cv-edit']]),
+    ];
+    expect(planBranchMove(nested, { op: 'switch', targetSeq: 7 }, 68)).toEqual({
+      kind: 'move',
+      leafId: 'depart-original',
     });
   });
 

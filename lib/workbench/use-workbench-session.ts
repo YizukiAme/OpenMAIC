@@ -16,17 +16,18 @@
  * Ported from the spike's `use-workbench-session.ts`, pointed at the PR1
  * control plane (`/api/agent/sessions/:id/events`, same-origin).
  */
-import { useEffect, useLayoutEffect, useRef } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 // The upstream host names this export `HOST_AGENT_LIFECYCLE`; the reference
 // calls it `LIFECYCLE`. The values are the same durable event names.
 import { HOST_AGENT_LIFECYCLE as LIFECYCLE } from '@/lib/agent-runtime/lifecycle';
+import { useCanvasStore } from '@/lib/store/canvas';
 import { getDocumentStore } from '@/lib/document-store/store';
 import { recordAgentChange } from '@/lib/edit/course-edit';
 import { useCourseTimeline } from '@/lib/edit/course-timeline';
 import { keepLocalWhereUnchanged } from '@/lib/edit/scene-echo';
 import type { AppDocumentOutline } from '@/lib/document-store/persistence-types';
 import { hydratePBLScenesFromRuntime } from '@/lib/pbl/v2/runtime/hydration';
-import { forgetKnownScenes } from '@/lib/store/known-scenes';
+import { forgetKnownScenes, resetKnownScenes } from '@/lib/store/known-scenes';
 import {
   forgetServerRosterBase,
   hasQueuedWholeDocumentChange,
@@ -64,6 +65,7 @@ import { FetchEventSource } from '@/lib/utils/fetch-event-source';
 import { applyGenerateTtsResultToScenes } from '@/lib/workbench/tts-stage-sync';
 import { useQuestionAutoConfirm } from '@/lib/workbench/question-auto-confirm';
 import { sessionScopedKey } from '@/lib/workbench/request-scope';
+import { branchReceipts } from './branch-fold';
 
 /**
  * pi's own `AgentEvent` types, which the runner appends verbatim.
@@ -118,6 +120,40 @@ export const WORKBENCH_EVENT_TYPES: readonly string[] = [
   ...LEGACY_WORKBENCH_EVENT_TYPES,
   ...PI_EVENT_TYPES,
 ];
+
+const COURSE_CHECKOUT_EVENT = 'openmaic:course-checkout';
+
+/** A checkout is a new undo baseline for exactly the documents actually replaced. */
+function announceCourseCheckouts(event: WorkbenchEvent): void {
+  if (
+    event.type !== LIFECYCLE.sessionStart &&
+    event.type !== LIFECYCLE.sessionResumed &&
+    event.type !== LIFECYCLE.sessionEnd
+  )
+    return;
+  for (const receipt of branchReceipts(event.data)) {
+    if (receipt.status !== 'applied') continue;
+    for (const course of receipt.checkedOut ?? []) {
+      if (course.outcome !== 'restored') continue;
+      useCourseTimeline.getState().clearCourse(course.stageId);
+      window.dispatchEvent(
+        new window.CustomEvent(COURSE_CHECKOUT_EVENT, { detail: course.stageId }),
+      );
+    }
+  }
+}
+
+/** A branch can replace the page being viewed with a new scene ID (slide → quiz).
+ * Keep that page's position, including when the document manifest arrives first. */
+function selectedSceneAfterSync(
+  current: string | null,
+  previous: readonly Scene[],
+  next: readonly Scene[],
+): string | null {
+  if (current && next.some((scene) => scene.id === current)) return current;
+  const index = previous.findIndex((scene) => scene.id === current);
+  return (index < 0 ? next.at(-1) : next[Math.min(index, next.length - 1)])?.id ?? null;
+}
 
 /** How long an open stream may take to send `caught_up`. */
 const REPLAY_WATCHDOG_MS = 20_000;
@@ -225,7 +261,9 @@ export function useWorkbenchStream(sessionId: string | null): void {
           useQuestionAutoConfirm.getState().unmarkLive(questionKey);
         }
       }
+      if (parsed.id <= useWorkbenchStore.getState().lastEventId) return;
       applyEvent(parsed);
+      announceCourseCheckouts(parsed);
       markAttached();
       // Start first: it judges an abandoned run by how long that run has been silent.
       if (parsed.type === 'agent_start') useCourseTimeline.getState().beginAgentRun(Date.now());
@@ -291,6 +329,9 @@ export function useWorkbenchStream(sessionId: string | null): void {
       // the document, so without this fold a re-attached client would keep
       // the placeholder's skeleton instead of the error state.
       for (const event of backlog) {
+        // A reattach from a known cursor can have missed a branch disappearing
+        // from under the open editor. A cold history read owns no such undo.
+        if (from > 0) announceCourseCheckouts(event);
         if (event.type !== LIFECYCLE.mediaReady) continue;
         const frame = parseMediaReadyFrame(event.data);
         if (frame) applyMediaReadyFrame(frame);
@@ -468,7 +509,8 @@ const UNVERIFIED_STAGE_REV = -1;
 export function useStageFreshnessSync(
   stageId: string | null,
   opts: { bootstrapDocument?: boolean } = {},
-): void {
+): boolean {
+  const [restoringStage, setRestoringStage] = useState<string | null>(null);
   const { bootstrapDocument = false } = opts;
   const generation = useRef(0);
   const activeStage = useRef<string | null>(null);
@@ -573,14 +615,19 @@ export function useStageFreshnessSync(
       }, STAGE_SYNC_FALLBACK_MS * jitter);
     };
 
+    let checkoutRequested = 0;
+    let checkoutApplied = 0;
     /** One pass: manifest → diff → narrow re-fetch → local apply. */
     const syncOnce = async () => {
       heldBackForSave.current = false;
       // Taken before the manifest: one older than an edit made since must not
       // decide what to drop or read, even if that edit is already saved.
       const editClock = stageDocumentEditClock();
+      const atCheckout = checkoutRequested;
+      const restoring = atCheckout !== checkoutApplied;
+      const stillCurrent = () => isCurrent() && atCheckout === checkoutRequested;
       const manifestResult = await fetchStageManifest(requestedStage);
-      if (!isCurrent()) return;
+      if (!stillCurrent()) return;
       if (manifestResult.status !== 'ok') {
         // The old `if (!doc) continue;` swallowed this and never entered the
         // retry budget; a just-created course could park the canvas on empty
@@ -592,18 +639,18 @@ export function useStageFreshnessSync(
       }
       const manifest = manifestResult.manifest;
 
-      if (renderedManifest.current === null) {
+      if (renderedManifest.current === null || restoring) {
         // First pass for this stage — establish the rendered baseline.
-        if (bootstrapDocumentRef.current) {
+        if (bootstrapDocumentRef.current || restoring) {
           // The sync is the delegated initial reader: one full read, manifest first so the
           // recorded baseline is never newer than the content it describes.
-          const editClock = stageDocumentEditClock();
+          if (restoring && useStageStore.getState().stage?.id !== requestedStage) return;
           const doc = await getDocumentStore().loadDocument(requestedStage);
-          if (!isCurrent()) return;
+          if (!stillCurrent()) return;
           let loadedScenes = (doc?.scenes ?? []) as unknown as Scene[];
           if (loadedScenes.some((scene) => scene.content?.type === 'pbl')) {
             loadedScenes = await hydratePBLScenesFromRuntime(requestedStage, loadedScenes);
-            if (!isCurrent()) return;
+            if (!stillCurrent()) return;
           }
           if (!doc) {
             console.warn(`[workbench] course document unavailable for ${requestedStage}; retrying`);
@@ -615,6 +662,7 @@ export function useStageFreshnessSync(
             return;
           }
           if (
+            (restoring && hasUnsavedStageEdit(requestedStage)) ||
             hasQueuedWholeDocumentChange(requestedStage) ||
             useStageStore
               .getState()
@@ -626,22 +674,49 @@ export function useStageFreshnessSync(
           const scenes = [...loadedScenes].sort((a, b) => a.order - b.order);
           const record = doc.outline as AppDocumentOutline | undefined;
           const outlines = (record?.outlines as SceneOutline[]) ?? [];
+          const generationComplete = record?.generationComplete ?? false;
+          const generatingOutlines = generationComplete
+            ? []
+            : outlines.filter((outline) => !scenes.some((scene) => scene.order === outline.order));
+          const previousStage = useStageStore.getState().stage;
+          if (restoring) resetKnownScenes(requestedStage);
           useStageStore.setState((state) => ({
             stage: (doc.stage as unknown as Stage) ?? state.stage,
             scenes,
             outlines,
-            // Select the newest page the first time anything exists, then
-            // leave the user's selection alone.
-            currentSceneId:
-              state.currentSceneId && scenes.some((s) => s.id === state.currentSceneId)
-                ? state.currentSceneId
-                : (scenes[scenes.length - 1]?.id ?? null),
-            generationComplete: record?.generationComplete ?? false,
-            outlineProducer: record?.producer ?? state.outlineProducer,
+            currentSceneId: selectedSceneAfterSync(
+              state.stage?.id === requestedStage ? state.currentSceneId : null,
+              state.scenes,
+              scenes,
+            ),
+            generationComplete,
+            outlineProducer: record?.producer ?? null,
+            outlineProducerRef: record?.producerRef ?? null,
+            ...(restoring
+              ? {
+                  generatingOutlines,
+                  failedOutlines: [],
+                  generationInterrupted:
+                    generatingOutlines.length > 0 && record?.producer !== 'server-job',
+                }
+              : {}),
           }));
           const loadedStage = useStageStore.getState().stage;
           if (loadedStage?.id === requestedStage) {
-            recordServerRosterBase(requestedStage, rosterOf(loadedStage));
+            const roster = rosterOf(loadedStage);
+            if (restoring && previousStage && !sameStageRoster(rosterOf(previousStage), roster)) {
+              useStageStore.getState().setStageAgents(loadedStage.generatedAgentConfigs ?? [], {
+                fromServer: true,
+                agentIds: loadedStage.agentIds,
+              });
+            }
+            recordServerRosterBase(requestedStage, roster);
+          }
+          if (restoring) {
+            useCanvasStore.getState().clearSelection();
+            setRestoringStage(null);
+            checkoutApplied = atCheckout;
+            coldBaseline.current = false;
           }
           renderedManifest.current = manifest;
           recordWriteBaseline(manifest);
@@ -700,7 +775,7 @@ export function useStageFreshnessSync(
       const queuedAtRead = hasQueuedWholeDocumentChange(requestedStage);
       if (queuedAtRead || idsToRead.length < idsToFetch.length) heldBackForSave.current = true;
       const { scenes: fetched, foldFailures } = await readScenes(requestedStage, idsToRead);
-      if (!isCurrent()) return;
+      if (!stillCurrent()) return;
 
       // D3-F1 structural guard: a non-empty request that fetched NOTHING must
       // abort this pass — do NOT advance `renderedManifest`, do NOT
@@ -758,10 +833,7 @@ export function useStageFreshnessSync(
         useStageStore.setState((state) => {
           const nextScenes = merge.changed ? (merge.scenes as Scene[]) : state.scenes;
           const current = state.currentSceneId;
-          const currentSceneId =
-            current && nextScenes.some((s) => s.id === current)
-              ? current
-              : (nextScenes[nextScenes.length - 1]?.id ?? null);
+          const currentSceneId = selectedSceneAfterSync(current, state.scenes, nextScenes);
           return {
             scenes: nextScenes,
             ...(currentSceneId !== current ? { currentSceneId } : {}),
@@ -916,6 +988,13 @@ export function useStageFreshnessSync(
     };
 
     // ── triggers ───────────────────────────────────────────────────────────
+    const onCheckout = (event: Event) => {
+      if ((event as CustomEvent<string>).detail !== requestedStage) return;
+      checkoutRequested += 1;
+      setRestoringStage(requestedStage);
+      requestSync('course-checkout');
+    };
+    window.addEventListener(COURSE_CHECKOUT_EVENT, onCheckout);
     requestSync('mount');
 
     const source = new FetchEventSource(
@@ -952,6 +1031,13 @@ export function useStageFreshnessSync(
       const now = (state as { stageSyncRequest?: number }).stageSyncRequest ?? 0;
       const before = (prev as { stageSyncRequest?: number }).stageSyncRequest ?? 0;
       if (now > before && heldBackForSave.current && isCurrent()) requestSync('save-settled');
+      if (
+        checkoutRequested !== checkoutApplied &&
+        state.stage?.id === requestedStage &&
+        prev.stage?.id !== requestedStage &&
+        isCurrent()
+      )
+        requestSync('course-loaded');
     });
 
     return () => {
@@ -964,6 +1050,9 @@ export function useStageFreshnessSync(
       if (sourceRef.current === source) sourceRef.current = null;
       document.removeEventListener('visibilitychange', onVisibility);
       unsubscribeSaveSettled();
+      window.removeEventListener(COURSE_CHECKOUT_EVENT, onCheckout);
+      setRestoringStage(null);
     };
   }, [stageId]);
+  return stageId !== null && restoringStage === stageId;
 }

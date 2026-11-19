@@ -32,7 +32,10 @@ export type UserMessageInputResult =
   | { ok: true; input: UserMessageInput }
   | { ok: false; code: 'INVALID_REQUEST' | 'MISSING_REQUIRED_FIELD'; message: string };
 
-export function parseUserMessageInput(body: UserMessageBody): UserMessageInputResult {
+export function parseUserMessageInput(
+  body: UserMessageBody,
+  retainedMaterials: readonly unknown[] = [],
+): UserMessageInputResult {
   const text = String(body.text ?? '').trim();
   if (
     body.materialIds !== undefined &&
@@ -59,7 +62,7 @@ export function parseUserMessageInput(body: UserMessageBody): UserMessageInputRe
   if (!decodedCourseRefs.ok) {
     return { ok: false, code: 'INVALID_REQUEST', message: decodedCourseRefs.error };
   }
-  if (!text && materialIds.length === 0) {
+  if (!text && materialIds.length === 0 && retainedMaterials.length === 0) {
     return { ok: false, code: 'MISSING_REQUIRED_FIELD', message: 'text is required' };
   }
   if (text.length > MAX_SESSION_TEXT_LENGTH) {

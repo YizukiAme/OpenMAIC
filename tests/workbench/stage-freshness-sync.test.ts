@@ -405,6 +405,58 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
+describe('a checked-out course', () => {
+  it.each(['receipt first', 'manifest first'])(
+    'stays on page two when its scene is replaced (%s)',
+    async (order) => {
+      await mount();
+      mocks.stageState.currentSceneId = 'scene-2';
+      const replacement = sceneData('quiz-2', 1, 1);
+      mocks.sceneContent['quiz-2'] = replacement;
+      manifestWith({
+        rev: 2,
+        scenes: [
+          { id: 'scene-1', order: 0, rev: 1 },
+          { id: 'quiz-2', order: 1, rev: 1 },
+          { id: 'scene-3', order: 2, rev: 1 },
+        ],
+      });
+      mocks.loadDocument.mockResolvedValue({
+        stage: { id: 'stage-a', name: 'Quiz' },
+        scenes: [mocks.sceneContent['scene-1'], replacement, mocks.sceneContent['scene-3']],
+        outline: { outlines: [], generationComplete: true },
+      });
+      if (order === 'manifest first') {
+        await act(async () => MockEventSource.instances[0]!.emitFreshness());
+        expect(mocks.stageState.currentSceneId).toBe('quiz-2');
+      }
+      await act(async () => {
+        window.dispatchEvent(new CustomEvent('openmaic:course-checkout', { detail: 'stage-a' }));
+      });
+      expect(mocks.stageState.currentSceneId).toBe('quiz-2');
+    },
+  );
+  it('loads the selected title, outline and pages together and keeps the selected page', async () => {
+    seedCourse(1);
+    mocks.stageState.stage = { id: 'stage-a' };
+    mocks.stageState.scenes = [sceneData('scene-1', 1), sceneData('scene-2', 1)];
+    mocks.stageState.currentSceneId = 'scene-2';
+    await mount({ bootstrapDocument: false });
+    mocks.loadDocument.mockResolvedValue({
+      stage: { id: 'stage-a', name: 'Selected title' },
+      scenes: [sceneData('scene-2', 2)],
+      outline: { outlines: [{ order: 1, title: 'Selected outline' }], generationComplete: true },
+    });
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent('openmaic:course-checkout', { detail: 'stage-a' }));
+    });
+    expect(mocks.stageState.stage).toMatchObject({ name: 'Selected title' });
+    expect(mocks.stageState.outlines).toEqual([{ order: 1, title: 'Selected outline' }]);
+    expect(mocks.stageState.scenes.map((s) => s.title)).toEqual(['scene-2 v2']);
+    expect(mocks.stageState.currentSceneId).toBe('scene-2');
+  });
+});
+
 describe('AC1: 另一个会话改这门课 → 画布收敛（判据在画布拿到的数据上）', () => {
   it('初始同步后，外部写入经 freshness 帧 → 画布的 scenes 收敛到新数据', async () => {
     await mount();

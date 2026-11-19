@@ -1,20 +1,10 @@
-/**
- * The conversation's branches, folded from the event log (#1317, prototype).
- *
- * The chat fold stays a flat, append-only list of nodes; this module tags every
- * node with the segment it belongs to and keeps the segments as a tree. A
- * segment is one user message (`user`) or one reply to it (`reply`). Editing a
- * message adds a sibling user segment, regenerating a reply adds a sibling
- * reply segment, and switching changes which child a segment shows. The
- * visible transcript is the nodes of the segments on the selected path
- * ({@link projectBranchChat}).
- *
- * Everything here reads only the event log -- `branch_request` events and the
- * order nodes appear in -- so a replayed log folds to exactly the branches a
- * live one did, and the UI stays a pure function of the events it has.
- */
-import type { ChatNode, SessionStatus } from './session-store';
+/** Conversation segments reconstructed from durable events. Each segment is one
+ * user message or one of its replies. A checkout stores the outgoing rows and
+ * puts the selected path back in the ordinary workbench fold, shared by the
+ * transcript, the question form and the course preview. */
+import type { ChatNode, SessionStatus, WorkbenchEvent, WorkbenchFold } from './session-store';
 
+type CourseProgress = Pick<WorkbenchFold, 'plan' | 'pages' | 'courseTitle'>;
 export const ROOT_SEGMENT = 'root';
 
 export interface BranchSegment {
@@ -30,26 +20,37 @@ export interface BranchSegment {
   variant?: number | 'orig';
   /** Reply segments: how the last run that wrote into it ended. */
   endStatus?: SessionStatus;
+  progress?: CourseProgress;
 }
 
-export type PendingBranch =
-  | { op: 'edit'; parent: string }
-  | { op: 'regenerate'; user: string; variant: number };
+export interface BranchReceipt {
+  requestSeq: number;
+  op: string;
+  status: 'applied' | 'rejected';
+  reason?: string;
+  rollbackFailed?: boolean;
+  checkedOut?: { stageId: string; outcome: string }[];
+}
+
+export function branchReceipts(data: unknown): BranchReceipt[] {
+  const branches = (data as { branches?: unknown } | null)?.branches;
+  return Array.isArray(branches)
+    ? branches.filter(
+        (r) =>
+          Number.isSafeInteger(r?.requestSeq) &&
+          (r.status === 'applied' || r.status === 'rejected'),
+      )
+    : [];
+}
 
 export interface BranchState {
   segments: Readonly<Record<string, BranchSegment>>;
-  /** The segment new nodes go to. */
   current: string;
-  /** A request whose new segment has not started yet. */
-  pending: PendingBranch | null;
-  /** Bumped by every request that changes the branch on screen. */
-  epoch: number;
-  /**
-   * The branch as it was before the latest request, so a request the runner
-   * rejects can be undone. The runner reports outcomes on the next lifecycle
-   * frame, before anything else lands on the branch.
-   */
-  beforeRequest?: { requestSeq: number; state: Omit<BranchState, 'beforeRequest'> } | null;
+  /** Rows of branches already visited, saved only when moving away. */
+  saved: Readonly<Record<string, ChatNode[]>>;
+  /** Branch requests and user messages received before the worker finishes checkout. */
+  inbox: readonly WorkbenchEvent[];
+  lastReceipt?: BranchReceipt;
 }
 
 export function initialBranchState(): BranchState {
@@ -64,8 +65,8 @@ export function initialBranchState(): BranchState {
       },
     },
     current: ROOT_SEGMENT,
-    pending: null,
-    epoch: 0,
+    saved: {},
+    inbox: [],
   };
 }
 
@@ -81,11 +82,9 @@ function update(
 
 /** The user segment of a durable message sequence (the newest, if replayed twice). */
 export function userSegmentOf(state: BranchState, userSeq: number): BranchSegment | undefined {
-  let found: BranchSegment | undefined;
-  for (const segment of Object.values(state.segments)) {
-    if (segment.kind === 'user' && segment.userSeq === userSeq) found = segment;
-  }
-  return found;
+  const segments = Object.values(state.segments);
+  if (userSeq === 0) return segments.find((segment) => segment.kind === 'user');
+  return segments.findLast((segment) => segment.kind === 'user' && segment.userSeq === userSeq);
 }
 
 /** The segments on screen, root first. */
@@ -99,107 +98,70 @@ export function activePath(state: BranchState): BranchSegment[] {
   return path;
 }
 
-/** Fold one `branch_request` event (`eventId` is its sequence). */
-export function applyBranchRequest(
+/** Apply a confirmed request, saving the current path before selecting the target. */
+export function checkoutBranch(fold: WorkbenchFold, request: WorkbenchEvent): WorkbenchFold {
+  const state = fold.branch!;
+  const { op, targetSeq, variant } = request.data as {
+    op: string;
+    targetSeq: number;
+    variant?: number | 'orig';
+  };
+  const user = userSegmentOf(state, targetSeq);
+  if (!user?.parent) return fold;
+  let target: string;
+  if (op === 'regenerate') target = user.id;
+  else if (op === 'edit') target = user.parent;
+  else if (variant === undefined) target = user.id;
+  else {
+    const reply = user.children
+      .map((id) => state.segments[id])
+      .find((child) => child?.variant === variant);
+    if (!reply) return fold;
+    target = reply.id;
+  }
+
+  const saved = { ...state.saved };
+  for (const segment of activePath(state)) saved[segment.id] = [];
+  for (const node of fold.chat) saved[node.segment ?? ROOT_SEGMENT]!.push(node);
+
+  let branch: BranchState = { ...state, saved, current: target };
+  let child = branch.segments[target]!;
+  while (child.parent) {
+    const id = child.id;
+    branch = update(branch, child.parent, (parent) => ({ ...parent, selected: id }));
+    child = branch.segments[child.parent]!;
+  }
+  if (op === 'regenerate') branch = startSegment(branch, 'reply', { variant: request.id });
+  else if (op === 'edit')
+    branch = update(branch, target, (parent) => ({ ...parent, selected: null }));
+  const path = activePath(branch);
+  const progress = path.findLast((segment) => segment.progress)?.progress;
+  return {
+    ...fold,
+    plan: progress?.plan ?? [],
+    pages: progress?.pages ?? {},
+    courseTitle: progress?.courseTitle ?? null,
+    chat: path.flatMap((segment) => saved[segment.id] ?? []),
+    branch: { ...branch, current: path.at(-1)!.id },
+    runCourseStageIds: [],
+    thinkingKey: null,
+    assistantKey: null,
+    waitingKey: null,
+    waitingArmed: false,
+    generatingOrder: null,
+    generationOpen: false,
+    error: null,
+  };
+}
+
+export function recordBranchProgress(
   state: BranchState,
-  data: unknown,
-  eventId: number,
+  { plan, pages, courseTitle }: CourseProgress,
 ): BranchState {
-  const next = moveForRequest(state, data, eventId);
-  if (next === state) return state;
-  const { beforeRequest: _previous, ...previous } = state;
-  return { ...next, beforeRequest: { requestSeq: eventId, state: previous } };
-}
-
-/**
- * What the notice for rejected requests says, most important first:
- * `rollback_failed` -- undoing a failed request failed too, so a course may be
- * left at another version; `edit` -- an edited message the runner could not
- * put in place is delivered as a new message at the end; `not_applied` -- a
- * course could not be restored, so nothing changed; `rejected` -- anything
- * else the runner turned down.
- */
-export type BranchRejectionNotice = 'rollback_failed' | 'edit' | 'not_applied' | 'rejected';
-
-const NOTICE_RANK: Record<BranchRejectionNotice, number> = {
-  rollback_failed: 3,
-  edit: 2,
-  not_applied: 1,
-  rejected: 0,
-};
-
-/**
- * Undo requests the runner rejected (`branches` on a lifecycle frame).
- * Returns how many were undone and the one notice to show for them.
- */
-export function applyBranchOutcomes(
-  state: BranchState,
-  data: unknown,
-): { state: BranchState; rejected: number; notice?: BranchRejectionNotice } {
-  const outcomes = (data as { branches?: unknown } | null)?.branches;
-  if (!Array.isArray(outcomes)) return { state, rejected: 0 };
-  let next = state;
-  let rejected = 0;
-  let notice: BranchRejectionNotice | undefined;
-  for (const outcome of outcomes) {
-    const { requestSeq, status, op, reason, rollbackFailed } = (outcome ?? {}) as {
-      requestSeq?: unknown;
-      status?: unknown;
-      op?: unknown;
-      reason?: unknown;
-      rollbackFailed?: unknown;
-    };
-    if (status !== 'rejected') continue;
-    rejected += 1;
-    const said: BranchRejectionNotice =
-      rollbackFailed === true
-        ? 'rollback_failed'
-        : op === 'edit'
-          ? 'edit'
-          : reason === 'checkout_failed' || reason === 'apply_failed'
-            ? 'not_applied'
-            : 'rejected';
-    if (!notice || NOTICE_RANK[said] > NOTICE_RANK[notice]) notice = said;
-    const before = next.beforeRequest;
-    if (before && before.requestSeq === requestSeq) {
-      next = { ...before.state, epoch: next.epoch + 1, beforeRequest: null };
-    }
-  }
-  return { state: next, rejected, ...(notice ? { notice } : {}) };
-}
-
-function moveForRequest(state: BranchState, data: unknown, eventId: number): BranchState {
-  const request = (data ?? {}) as { op?: unknown; targetSeq?: unknown; variant?: unknown };
-  if (typeof request.targetSeq !== 'number') return state;
-  const user = userSegmentOf(state, request.targetSeq);
-  if (!user || user.parent === null) return state;
-  switch (request.op) {
-    case 'edit':
-      return { ...state, pending: { op: 'edit', parent: user.parent }, epoch: state.epoch + 1 };
-    case 'regenerate':
-      return {
-        ...state,
-        current: user.id,
-        pending: { op: 'regenerate', user: user.id, variant: eventId },
-        epoch: state.epoch + 1,
-      };
-    case 'switch': {
-      let next: BranchState;
-      if (request.variant === undefined) {
-        next = update(state, user.parent, (parent) => ({ ...parent, selected: user.id }));
-      } else {
-        const reply = user.children
-          .map((id) => state.segments[id])
-          .find((segment) => segment?.kind === 'reply' && segment.variant === request.variant);
-        if (!reply) return state;
-        next = update(state, user.id, (segment) => ({ ...segment, selected: reply.id }));
-      }
-      const path = activePath(next);
-      return { ...next, current: path[path.length - 1]!.id, pending: null, epoch: state.epoch + 1 };
-    }
-    default:
-      return state;
-  }
+  return update(state, state.current, (segment) => ({
+    ...segment,
+    progress: { plan, pages, courseTitle },
+  }));
 }
 
 function startSegment(
@@ -207,22 +169,13 @@ function startSegment(
   kind: 'user' | 'reply',
   extra: Pick<BranchSegment, 'userSeq' | 'variant'>,
 ): BranchState {
-  let parent = state.current;
-  let pending = state.pending;
-  if (kind === 'user' && pending?.op === 'edit') {
-    parent = pending.parent;
-    pending = null;
-  } else if (kind === 'reply' && pending?.op === 'regenerate') {
-    parent = pending.user;
-    pending = null;
-  }
+  const parent = state.current;
   const id = `s${Object.keys(state.segments).length}`;
   const segment: BranchSegment = { id, kind, parent, children: [], selected: null, ...extra };
   const withSegment: BranchState = {
     ...state,
     segments: { ...state.segments, [id]: segment },
     current: id,
-    pending,
   };
   return update(withSegment, parent, (owner) => ({
     ...owner,
@@ -243,10 +196,6 @@ export function userSeqOfNodeKey(key: string): number | undefined {
  * needed: a user node starts a user segment; anything else starts a reply
  * segment unless one is already open.
  *
- * A node whose segment a rejected request created (and undoing removed) is
- * tagged again where it now belongs: an edited message the runner could not
- * put in place is delivered at the end of the branch the conversation stayed
- * on, so that is where it shows.
  */
 export function assignSegments(
   previous: readonly ChatNode[],
@@ -269,13 +218,8 @@ export function assignSegments(
     if (!segment) {
       if (node.kind === 'user') {
         branch = startSegment(branch, 'user', { userSeq: userSeqOfNodeKey(node.key) });
-      } else if (
-        branch.segments[branch.current]?.kind !== 'reply' ||
-        branch.pending?.op === 'regenerate'
-      ) {
-        branch = startSegment(branch, 'reply', {
-          variant: branch.pending?.op === 'regenerate' ? branch.pending.variant : 'orig',
-        });
+      } else if (branch.segments[branch.current]?.kind !== 'reply') {
+        branch = startSegment(branch, 'reply', { variant: 'orig' });
       }
       segment = branch.current;
     }
@@ -313,9 +257,8 @@ export interface BranchView {
   segments: Readonly<Record<string, BranchSegment>>;
 }
 
-export function projectBranchChat(chat: readonly ChatNode[], state: BranchState): BranchView {
+export function projectBranchChat(chat: ChatNode[], state: BranchState): BranchView {
   const path = activePath(state);
-  const onPath = new Set(path.map((segment) => segment.id));
   const forks = new Map<string, BranchFork>();
   for (const segment of path) {
     if (!segment.parent) continue;
@@ -333,6 +276,5 @@ export function projectBranchChat(chat: readonly ChatNode[], state: BranchState)
       });
     }
   }
-  const visible = chat.filter((node) => !node.segment || onPath.has(node.segment));
-  return { chat: visible, forks, segments: state.segments };
+  return { chat, forks, segments: state.segments };
 }

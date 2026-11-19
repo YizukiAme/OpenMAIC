@@ -411,6 +411,13 @@ const SHIPPED: readonly (readonly [
     false,
     'c9f37030c3a52ade2637755b5d32088ec23e70e39ae02511645a3fcebf5e1513',
   ],
+  [
+    'course-versions',
+    2,
+    'observed-document-revision',
+    true,
+    '71838e1eeb0f1bc45a6936fdaf02116298420a77142037de6550f46700d2b8ba',
+  ],
 ];
 
 /**

@@ -48,8 +48,10 @@ export interface TransactionSource {
   connect(): Promise<PoolClientLike>;
 }
 
-export interface OwnerBoundDocumentStoreOptions {
-  pool: TransactionSource;
+export type OwnerBoundDocumentStoreOptions = (
+  | { pool: TransactionSource }
+  | { transaction: Queryable }
+) & {
   ownerId: string;
   validateScene: SceneValidator;
   validateStage: StageValidator;
@@ -69,7 +71,7 @@ export interface OwnerBoundDocumentStoreOptions {
   principal?: OwnerPrincipal;
   /** The create hooks; defaults to the registered ones (`configurePersistenceHooks`). */
   createHooks?: Pick<PersistenceHooks, 'name' | 'authorizeCreate' | 'onCreate'>;
-}
+};
 
 /** The code a refused course creation answers with, as `403`. */
 export const CREATE_REFUSED = 'CREATE_REFUSED';
@@ -340,6 +342,43 @@ class OwnerBoundDocumentStore<TScene extends SceneLike, TStage extends Stage>
   }
 
   /**
+   * Restore an existing course under one mutation gate. A current-version
+   * restore supplies only changed scenes and the ids to remove; a legacy
+   * version goes through the package's whole-document migration.
+   */
+  restoreDocument(
+    document: MaicDocument<TScene, TStage>,
+    delta?: { removedSceneIds: string[]; outlineChanged: boolean },
+  ): Promise<void> {
+    const doc = sanitizedDocument(document);
+    const stageId = doc.stage.id;
+    return this.tagged({ stageId, mode: 'mutate', content: true }, () =>
+      this.runTransaction(async (tx) => {
+        const pinned = this.pinnedToTransaction(tx);
+        if (delta) {
+          for (const id of delta.removedSceneIds) await pinned.deleteScene(stageId, id);
+          for (const scene of doc.scenes) await pinned.putScene(stageId, scene);
+          if (delta.outlineChanged) {
+            if (doc.outline === undefined) {
+              await tx.query('DELETE FROM document_outlines WHERE stage_id = $1', [stageId]);
+            } else {
+              await tx.query(
+                `INSERT INTO document_outlines (stage_id, data) VALUES ($1, $2::jsonb)
+                 ON CONFLICT (stage_id) DO UPDATE SET data = EXCLUDED.data`,
+                [stageId, JSON.stringify(doc.outline)],
+              );
+            }
+          }
+          await pinned.putStage(stageId, doc.stage);
+        } else {
+          await pinned.saveDocument(doc);
+        }
+        if (outlineCompletesGeneration(doc.outline)) await markStageGenerationComplete(tx, stageId);
+      }),
+    );
+  }
+
+  /**
    * {@link saveDocument}, refused with {@link StageIdTakenError} when any
    * course holds the id. Decided inside the create's transaction, under the
    * per-id create lock, so two creates of one id cannot both land.
@@ -585,7 +624,8 @@ export function createOwnerBoundDocumentStore<
 ): DocumentStore<TScene, TStage> &
   DocumentFolderStore &
   CreateOnlyDocumentStore<TScene, TStage> &
-  StageRowStore<TStage> {
+  StageRowStore<TStage> &
+  Pick<OwnerBoundDocumentStore<TScene, TStage>, 'restoreDocument'> {
   const operations = new OperationScope();
   if (options.principal && options.principal.ownerId !== options.ownerId) {
     throw new Error('createOwnerBoundDocumentStore: principal does not match ownerId');
@@ -598,11 +638,12 @@ export function createOwnerBoundDocumentStore<
   const withTransaction: WithTransaction = async (body) => {
     // Read before the first await, from this call's own context (see `tagged`).
     const operation = operations.current();
-    const client = await options.pool.connect();
+    // A branch checkout already owns its transaction and its lifetime.
+    const client = 'pool' in options ? await options.pool.connect() : null;
     try {
-      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+      await client?.query('BEGIN ISOLATION LEVEL READ COMMITTED');
       try {
-        const queryable = queryableFor(client);
+        const queryable = 'transaction' in options ? options.transaction : queryableFor(client!);
         if (operation && operation.mode !== 'read') {
           // First, before any row lock: the identity lock orders this write
           // against a claim of its owner, and a retired owner writes nothing
@@ -696,19 +737,20 @@ export function createOwnerBoundDocumentStore<
         }
         if (operation?.mode === 'mutate') await operation.inTransaction?.(queryable);
         if (operation && operation.mode !== 'read') await options.mutationFence?.(queryable);
-        await client.query('COMMIT');
+        await client?.query('COMMIT');
         return result;
       } catch (error) {
-        await client.query('ROLLBACK');
+        await client?.query('ROLLBACK');
         throw error;
       }
     } finally {
-      client.release();
+      client?.release();
     }
   };
 
   const queryable: Queryable = {
     async query<TRow extends Record<string, unknown>>(text: string, params?: unknown[]) {
+      if ('transaction' in options) return options.transaction.query<TRow>(text, params);
       const client = await options.pool.connect();
       try {
         return await queryableFor(client).query<TRow>(text, params);

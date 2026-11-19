@@ -3,22 +3,27 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { Session } from '@earendil-works/pi-agent-core';
 
-import {
-  PgAgentSessionStore,
-  ensureAgentSessionSchema,
-} from '../../packages/@openmaic/storage/src/agent-session/pg';
-import { ensureAssetSchema } from '../../packages/@openmaic/storage/src/asset/pg';
+import { PgAgentSessionStore, ensureAgentSessionSchema } from '@openmaic/storage/agent-session/pg';
+import { ensureAssetSchema } from '@openmaic/storage/asset/pg';
+import { AssetCollector } from '@openmaic/storage/asset/collector';
+import { PgAssetByteStore } from '@openmaic/storage/asset/pg-bytes';
 import {
   ensureDocumentSchema,
+  readStageFreshnessManifest,
   type Queryable,
-  type WithTransaction,
-} from '../../packages/@openmaic/storage/src/document/pg';
-import { assetPrincipalForOwner } from '@/lib/persistence/owner-assets';
+} from '@openmaic/storage/document/pg';
+import { validateAppScene, validateAppStage } from '@/lib/document-store/validators';
+import { createOwnerBoundDocumentStore } from '@/lib/persistence/owner-bound-document-store';
+import { diffStageManifest } from '@/lib/workbench/stage-freshness';
+import {
+  assetPrincipalForOwner,
+  assetReferencePrincipalsForOwner,
+} from '@/lib/persistence/owner-assets';
+import { STAGE_META_OWNERSHIP } from '@/lib/persistence/stage-meta-ownership';
 import { ensureStageMetaSchema } from '@/lib/persistence/stage-meta';
 import { AgentSessionEntryStorage } from '@/lib/server/agent-runtime/entry-tree-storage';
 import {
   applyBranchRequests,
-  readPendingBranchRequests,
   recordCourseVersions,
   type CourseVersionDeps,
 } from '@/lib/server/course-versions/branching';
@@ -29,18 +34,16 @@ import {
   snapshotCourse,
   type CourseVersionDatabase,
 } from '@/lib/server/course-versions/store';
-import { COURSE_VERSIONS_ENTRY, REPLY_VARIANT_ENTRY } from '@/lib/server/course-versions/tree';
+import { agentSessionStoreIn, nodePostgresTransaction } from '@/lib/server/agent-runtime/store';
+import { readAgentMessageLog } from '@/lib/server/agent-runtime/user-messages';
+import { forwardOwnerWrite } from '@/lib/persistence/owner-merges';
+import { COURSE_VERSIONS_ENTRY, type BranchRequestData } from '@/lib/server/course-versions/tree';
 
-import {
-  MemoryDocuments,
-  appendAssistant,
-  appendUser,
-  course,
-  memorySession,
-  titles,
-} from './memory-tree';
+import { appendAssistant, appendUser, course, titles } from './memory-tree';
 
 const contractUrl = process.env.PG_CONTRACT_URL;
+if (process.env.STORAGE_PG_CONTRACT_REQUIRED === '1' && !contractUrl)
+  throw new Error('Course versions require PG_CONTRACT_URL for the PostgreSQL contract tests');
 const TEST_SCHEMA = `openmaic_course_versions_${process.pid}`;
 const OWNER = 'owner-1';
 const base = [
@@ -52,23 +55,6 @@ const withExtra = (pageId: string, extra: string) =>
   base.map((page) => (page.id === pageId ? { ...page, extra } : page));
 const STAGE = 'stage-photosynthesis';
 const STAGE_B = 'stage-respiration';
-
-function transactionFor(pool: Pool): WithTransaction {
-  return async (body) => {
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      const result = await body(client as Queryable);
-      await client.query('COMMIT');
-      return result;
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
-  };
-}
 
 describe.skipIf(!contractUrl)('course versions (#1317 prototype)', () => {
   let admin: Pool;
@@ -86,13 +72,13 @@ describe.skipIf(!contractUrl)('course versions (#1317 prototype)', () => {
     await ensureAssetSchema(queryable);
     await ensureAgentSessionSchema(queryable);
     await ensureCourseVersionSchema(queryable);
-    db = { queryable, withTransaction: transactionFor(pool) };
+    db = { queryable, withTransaction: nodePostgresTransaction(pool) };
   });
 
   beforeEach(async () => {
     await pool.query(
       `TRUNCATE course_versions, course_version_pages, asset_root_refs, document_asset_refs,
-                asset_entries, asset_blobs CASCADE`,
+                asset_entries, asset_blobs, agent_sessions, document_stages, document_stage_revision, document_scene_revision CASCADE`,
     );
   });
 
@@ -104,462 +90,547 @@ describe.skipIf(!contractUrl)('course versions (#1317 prototype)', () => {
     }
   });
 
+  function documents(ownerId = OWNER) {
+    return createOwnerBoundDocumentStore({
+      pool,
+      ownerId,
+      validateScene: validateAppScene,
+      validateStage: validateAppStage,
+    });
+  }
+
+  const snapshot = (stageId = STAGE) =>
+    snapshotCourse(db, { ownerId: OWNER, stageId, origin: 'after_run' });
+  const checkout = (versionId: string, stageId = STAGE) =>
+    checkoutCourseVersion(db, { ownerId: OWNER, stageId, versionId });
+  const manifest = (stageId = STAGE) => readStageFreshnessManifest(stageId, db.queryable);
+
   describe('the store', () => {
-    it('has nothing to record for a course that does not exist yet', async () => {
-      const documents = new MemoryDocuments();
+    it('only snapshots live courses owned by the runner, including when it has a shared link', async () => {
+      expect(await snapshot()).toBeNull();
+      await documents('a-different-owner').saveDocument(course(STAGE, base));
+      expect(await documents().loadDocument(STAGE)).not.toBeNull();
+      expect(await snapshot()).toBeNull();
+      expect((await pool.query('SELECT id FROM course_versions')).rows).toEqual([]);
+    });
+
+    it('reuses one version across concurrent snapshots, same-content saves and checkouts', async () => {
+      const store = documents();
+      await store.saveDocument(course(STAGE, base));
+      const versions = await Promise.all(Array.from({ length: 4 }, () => snapshot()));
+      const original = versions[0]!.id;
+      expect(new Set(versions.map((version) => version!.id)).size).toBe(1);
+      await store.saveDocument(course(STAGE, withExtra('p2', 'video')));
+      expect((await snapshot())!.id).not.toBe(original);
       expect(
-        await snapshotCourse(db, {
-          ownerId: OWNER,
-          stageId: STAGE,
-          origin: 'before_run',
-          documents,
-        }),
-      ).toBeNull();
+        (await pool.query('SELECT count(*)::int AS count FROM course_version_pages')).rows[0].count,
+      ).toBe(4);
+      await store.saveDocument(course(STAGE, base));
+      expect((await snapshot())!.id).toBe(original);
+      const before = await manifest();
+      expect(await checkout(original)).toBe('unchanged');
+      expect(await manifest()).toEqual(before);
     });
 
-    it('reuses a version for equal content and stores each distinct page once', async () => {
-      const documents = new MemoryDocuments();
-      await documents.saveDocument(
-        course(STAGE, [
-          { id: 'p1', title: 'What it is' },
-          { id: 'p2', title: 'Light reactions' },
-          { id: 'p3', title: 'Calvin cycle' },
-        ]),
+    it('restores only changed, added or removed pages, including outline and stage-only changes', async () => {
+      const store = documents();
+      const saved = course(STAGE, base);
+      saved.outline = { requirements: ['practice'] };
+      await store.saveDocument(saved);
+      const original = (await snapshot())!.id;
+      await store.saveDocument(
+        course(STAGE, [base[0]!, { ...base[1]!, extra: 'video' }, { id: 'p4', title: 'New' }]),
       );
-      const first = await snapshotCourse(db, {
-        ownerId: OWNER,
-        stageId: STAGE,
-        origin: 'after_run',
-        documents,
+      const previous = await manifest();
+      expect(await checkout(original)).toBe('restored');
+      expect(diffStageManifest(previous, await manifest())).toEqual({
+        changed: ['p2'],
+        added: ['p3'],
+        removed: ['p4'],
       });
-      const again = await snapshotCourse(db, {
-        ownerId: OWNER,
-        stageId: STAGE,
-        origin: 'before_run',
-        documents,
+      expect(await store.loadDocument(STAGE)).toMatchObject({
+        outline: { requirements: ['practice'] },
       });
-      expect(again?.id).toBe(first?.id);
-
-      await documents.saveDocument(
-        course(STAGE, [
-          { id: 'p1', title: 'What it is' },
-          { id: 'p2', title: 'Light reactions', extra: 'video' },
-          { id: 'p3', title: 'Calvin cycle' },
-        ]),
-      );
-      const second = await snapshotCourse(db, {
-        ownerId: OWNER,
-        stageId: STAGE,
-        origin: 'after_run',
-        documents,
+      const restored = (await store.loadDocument(STAGE))!;
+      await store.saveDocument({
+        ...restored,
+        stage: { ...restored.stage, name: 'Renamed' },
+        outline: null,
       });
-      expect(second?.id).not.toBe(first?.id);
-      const pages = await pool.query('SELECT count(*)::int AS n FROM course_version_pages');
-      // Three pages, then one changed page: four distinct rows, not six.
-      expect(pages.rows[0].n).toBe(4);
-    });
-
-    it('writes a version back, and leaves an equal course alone', async () => {
-      const documents = new MemoryDocuments();
-      await documents.saveDocument(course(STAGE, [{ id: 'p1', title: 'Before' }]));
-      const before = await snapshotCourse(db, {
-        ownerId: OWNER,
-        stageId: STAGE,
-        origin: 'after_run',
-        documents,
-      });
-      await documents.saveDocument(
-        course(STAGE, [
-          { id: 'p1', title: 'After' },
-          { id: 'p2', title: 'New' },
-        ]),
-      );
-
-      expect(
-        await checkoutCourseVersion(db, { versionId: before!.id, stageId: STAGE, documents }),
-      ).toBe('restored');
-      expect(titles(await documents.loadDocument(STAGE))).toEqual(['Before']);
-      const saves = documents.saves;
-      expect(
-        await checkoutCourseVersion(db, { versionId: before!.id, stageId: STAGE, documents }),
-      ).toBe('unchanged');
-      expect(documents.saves).toBe(saves);
-      expect(
-        await checkoutCourseVersion(db, { versionId: before!.id, stageId: 'other', documents }),
-      ).toBe('missing');
-    });
-
-    it("roots the owner's assets the course names, and only those", async () => {
-      const principal = assetPrincipalForOwner(OWNER).key;
-      await pool.query(
-        `INSERT INTO asset_blobs (content_hash, byte_size) VALUES ('h-video', 10), ('h-shared', 10)`,
-      );
-      await pool.query(
-        `INSERT INTO asset_entries (id, principal, content_hash, mime, meta, created_at)
-         VALUES ('asset-video', $1, 'h-video', 'video/mp4', '{}', 1),
-                ('asset-shared', 'shared', 'h-shared', 'image/png', '{}', 1)`,
-        [principal],
-      );
-      await pool.query(
-        `INSERT INTO document_asset_refs (stage_id, scope, scene_id, asset_id)
-         VALUES ($1, 'scene', 'p2', 'asset-video'), ($1, 'scene', 'p1', 'asset-shared')`,
-        [STAGE],
-      );
-      const documents = new MemoryDocuments();
-      await documents.saveDocument(course(STAGE, [{ id: 'p1', title: 'With media' }]));
-      const version = await snapshotCourse(db, {
-        ownerId: OWNER,
-        stageId: STAGE,
-        origin: 'after_run',
-        documents,
-      });
-      const roots = await pool.query(
-        'SELECT root_kind, root_id, asset_id FROM asset_root_refs ORDER BY asset_id',
-      );
-      expect(roots.rows).toEqual([
-        { root_kind: COURSE_VERSION_ROOT_KIND, root_id: version!.id, asset_id: 'asset-video' },
-      ]);
-    });
-  });
-
-  describe('branches of a conversation', () => {
-    function depsFor(documents: MemoryDocuments) {
-      const { session, storage } = memorySession();
-      const deps: CourseVersionDeps & { hasPendingMedia: () => boolean } = {
-        sessionId: 'session-1',
-        ownerId: OWNER,
-        defaultStageId: STAGE,
-        session,
-        writeEntry: (write) => write(),
-        documents,
-        db,
-        hasPendingMedia: () => false,
-      };
-      return { deps, session, storage };
-    }
-
-    it('records a version only when a course changed', async () => {
-      const documents = new MemoryDocuments();
-      await documents.saveDocument(course(STAGE, base));
-      const { deps, storage } = depsFor(documents);
-      await recordCourseVersions(deps, { phase: 'after_run' });
-      await recordCourseVersions(deps, { phase: 'before_run' });
-      const marks = storage.entries.filter(
-        (entry) =>
-          entry.type === 'custom' &&
-          (entry as { customType?: string }).customType === COURSE_VERSIONS_ENTRY,
-      );
-      expect(marks).toHaveLength(1);
-    });
-
-    it('regenerates, edits and switches with the course following the branch', async () => {
-      const documents = new MemoryDocuments();
-      await documents.saveDocument(course(STAGE, base));
-      const { deps, session, storage } = depsFor(documents);
-
-      // ① and its reply.
-      await appendUser(session, 'make a photosynthesis lesson');
-      await appendAssistant(session, 'outline and three pages');
-      await recordCourseVersions(deps, { phase: 'after_run', status: 'succeeded' });
-
-      // A hand edit between runs, then ③ (durable seq 7): the version taken
-      // before the run keeps the hand edit.
-      await documents.saveDocument(course(STAGE, withExtra('p1', 'hand-edited title')));
-      await recordCourseVersions(deps, { phase: 'before_run' });
-      await appendUser(session, 'add an experiment video to page 2', 7);
-      await appendAssistant(session, 'added a video');
-      await documents.saveDocument(
-        course(
-          STAGE,
-          withExtra('p1', 'hand-edited title').map((page) =>
-            page.id === 'p2' ? { ...page, extra: 'video' } : page,
-          ),
-        ),
-      );
-      await recordCourseVersions(deps, { phase: 'after_run', status: 'succeeded' });
-      expect(titles(await documents.loadDocument(STAGE))).toEqual([
-        'What it is+hand-edited title',
-        'Light reactions+video',
-        'Calvin cycle',
-      ]);
-
-      // Regenerate ③'s reply (request #20): the course goes back to just
-      // before ③, hand edit included.
-      const regenerated = await applyBranchRequests(deps, [
-        { seq: 20, data: { op: 'regenerate', targetSeq: 7 } },
-      ]);
-      expect(regenerated.outcomes).toMatchObject([{ requestSeq: 20, status: 'applied' }]);
-      expect(regenerated.regenerated).toBe(true);
-      expect(titles(await documents.loadDocument(STAGE))).toEqual([
-        'What it is+hand-edited title',
+      const oldManifest = await manifest();
+      expect(await checkout(original)).toBe('restored');
+      expect((await store.loadDocument(STAGE))!.stage.name).toBe('Photosynthesis');
+      expect((await manifest()).scenes).toEqual(oldManifest.scenes);
+      await store.saveDocument(course(STAGE, [base[1]!, base[0]!, base[2]!]));
+      const reordered = await manifest();
+      await checkout(original);
+      expect(diffStageManifest(reordered, await manifest()).changed).toEqual(['p1', 'p2']);
+      expect(titles(await store.loadDocument(STAGE))).toEqual([
+        'What it is',
         'Light reactions',
         'Calvin cycle',
       ]);
-      const leaf = await session.getLeafId();
-      const marker = storage.entries.find((entry) => entry.id === leaf)!;
-      expect(marker).toMatchObject({
-        type: 'custom',
-        customType: REPLY_VARIANT_ENTRY,
-        data: { requestSeq: 20 },
-      });
+    });
 
-      // The new reply builds an animation instead.
-      await appendAssistant(session, 'added an animation');
-      await documents.saveDocument(
-        course(
-          STAGE,
-          withExtra('p1', 'hand-edited title').map((page) =>
-            page.id === 'p2' ? { ...page, extra: 'animation' } : page,
-          ),
-        ),
+    it('retains owned and legacy shared media after leaving their branch', async () => {
+      const store = documents();
+      await store.saveDocument(course(STAGE, base));
+      const empty = (await snapshot())!.id;
+      await pool.query("INSERT INTO asset_blobs (content_hash, byte_size) VALUES ('media', 10)");
+      await pool.query(
+        `INSERT INTO asset_entries(id,principal,content_hash,mime,meta,created_at)
+          VALUES ('own', $1, 'media','video/mp4','{}',1), ('legacy','shared','media','video/mp4','{}',1),
+                 ('foreign','owner:other','media','video/mp4','{}',1), ('retained',$1,'media','video/mp4','{}',1)`,
+        [assetPrincipalForOwner(OWNER).key],
       );
-      await recordCourseVersions(deps, { phase: 'after_run', status: 'succeeded' });
-
-      // Switch back to the original reply: the video is back.
-      const backToOriginal = await applyBranchRequests(deps, [
-        { seq: 25, data: { op: 'switch', targetSeq: 7, variant: 'orig' } },
-      ]);
-      expect(backToOriginal).toMatchObject({
-        outcomes: [{ requestSeq: 25, op: 'switch', status: 'applied' }],
-        regenerated: false,
-      });
-      expect(titles(await documents.loadDocument(STAGE))[1]).toBe('Light reactions+video');
-
-      // A hand edit on this branch survives switching away and back.
-      await documents.saveDocument(
-        course(
-          STAGE,
-          withExtra('p1', 'hand-edited title').map((page) =>
-            page.id === 'p2'
-              ? { ...page, extra: 'video' }
-              : page.id === 'p3'
-                ? { ...page, extra: 'note' }
-                : page,
-          ),
-        ),
+      const withMedia = course(STAGE, base);
+      withMedia.stage.videoManifest = Object.fromEntries(
+        ['own', 'legacy', 'foreign'].map((id) => [id, { type: 'video', prompt: 'An experiment' }]),
       );
-      await applyBranchRequests(deps, [
-        { seq: 26, data: { op: 'switch', targetSeq: 7, variant: 20 } },
+      await store.saveDocument(withMedia);
+      await pool.query(
+        "INSERT INTO document_asset_refs (stage_id,scope,scene_id,asset_id) VALUES ($1,'retained','server','retained')",
+        [STAGE],
+      );
+      const media = (await snapshot())!.id;
+      expect(await checkout(empty)).toBe('restored');
+      expect(
+        (await pool.query("SELECT asset_id FROM document_asset_refs WHERE scope <> 'retained'"))
+          .rows,
+      ).toEqual([]);
+      expect(
+        (
+          await pool.query(
+            'SELECT asset_id FROM asset_root_refs WHERE root_kind=$1 AND root_id=$2 ORDER BY asset_id',
+            [COURSE_VERSION_ROOT_KIND, media],
+          )
+        ).rows,
+      ).toEqual([{ asset_id: 'legacy' }, { asset_id: 'own' }]);
+      await pool.query(`UPDATE asset_entries SET committed_at='2000-01-01', unreferenced_at='2000-01-01'
+        WHERE id='foreign'`);
+      const collector = new AssetCollector(db.queryable, new PgAssetByteStore(db.queryable), {
+        withTransaction: db.withTransaction,
+        documentReferences: true,
+        documentOwnership: STAGE_META_OWNERSHIP,
+        assetReferencePrincipals: assetReferencePrincipalsForOwner,
+      });
+      expect((await collector.collectPass()).entriesCollected).toBe(1);
+      expect(await checkout(media)).toBe('restored');
+      expect(
+        (
+          await pool.query(
+            "SELECT asset_id FROM document_asset_refs WHERE scope <> 'retained' ORDER BY asset_id",
+          )
+        ).rows,
+      ).toEqual([{ asset_id: 'legacy' }, { asset_id: 'own' }]);
+    });
+
+    it('gives a pre-upgrade version its shared media root when it is used again', async () => {
+      const store = documents();
+      await pool.query("INSERT INTO asset_blobs (content_hash, byte_size) VALUES ('old-media', 1)");
+      await pool.query(`INSERT INTO asset_entries(id,principal,content_hash,mime,meta,created_at)
+        VALUES ('legacy','shared','old-media','video/mp4','{}',1)`);
+      const withMedia = course(STAGE, base);
+      withMedia.stage.videoManifest = { legacy: { type: 'video', prompt: 'An experiment' } };
+      await store.saveDocument(withMedia);
+      const original = (await snapshot())!.id;
+      // v1 versions have no observed revision or shared-asset roots.
+      await pool.query('UPDATE course_versions SET observed_revision=NULL WHERE id=$1', [original]);
+      await pool.query('DELETE FROM asset_root_refs WHERE root_id=$1', [original]);
+      expect((await snapshot())?.id).toBe(original);
+      await store.saveDocument(course(STAGE, base));
+      expect(
+        (await pool.query('SELECT asset_id FROM asset_root_refs WHERE root_id=$1', [original]))
+          .rows,
+      ).toEqual([{ asset_id: 'legacy' }]);
+    });
+
+    it('pins a newly available asset when a save reuses an earlier version', async () => {
+      const store = documents();
+      const withMedia = course(STAGE, base);
+      withMedia.stage.videoManifest = { late: { type: 'video', prompt: 'An experiment' } };
+      await store.saveDocument(withMedia);
+      const original = (await snapshot())!.id;
+      await pool.query("INSERT INTO asset_blobs (content_hash, byte_size) VALUES ('media', 1)");
+      await pool.query(`INSERT INTO asset_entries(id,principal,content_hash,mime,meta,created_at)
+        VALUES ('late','shared','media','video/mp4','{}',1)`);
+      await store.saveDocument(withMedia);
+      expect((await snapshot())?.id).toBe(original);
+      await store.saveDocument(course(STAGE, base));
+      expect(
+        (await pool.query('SELECT asset_id FROM asset_root_refs WHERE root_id=$1', [original]))
+          .rows,
+      ).toEqual([{ asset_id: 'late' }]);
+    });
+
+    it('reuses v1 hashes while distinguishing a missing outline from an explicit null', async () => {
+      const doc = course(STAGE, base);
+      const store = documents();
+      await store.saveDocument(doc);
+      const v1 = (await snapshot())!.id;
+      // The v1 content hash included "outline: null" for either representation.
+      await pool.query(
+        "UPDATE course_versions SET outline='null'::jsonb, observed_revision=NULL WHERE id=$1",
+        [v1],
+      );
+      await store.saveDocument({ ...doc, outline: null });
+      expect((await snapshot())!.id).toBe(v1);
+      await store.saveDocument(doc);
+      expect((await snapshot())!.id).not.toBe(v1);
+      expect(await checkout(v1)).toBe('restored');
+      expect(await store.loadDocument(STAGE)).toHaveProperty('outline', null);
+    });
+
+    it('restores a legacy DSL document and refuses to replace a newer DSL or another course', async () => {
+      const store = documents();
+      await store.saveDocument(course(STAGE, base));
+      const original = (await snapshot())!.id;
+      await store.saveDocument(course(STAGE, withExtra('p2', 'video')));
+      await pool.query("UPDATE document_stages SET data=data-'dslVersion' WHERE id=$1", [STAGE]);
+      expect(await checkout(original)).toBe('restored');
+      expect(titles(await store.loadDocument(STAGE))[1]).toBe('Light reactions');
+      await pool.query(
+        `UPDATE document_stages SET data=data || '{"dslVersion":"99.0.0"}'::jsonb WHERE id=$1`,
+        [STAGE],
+      );
+      await expect(checkout(original)).rejects.toMatchObject({ kind: 'future' });
+      await store.saveDocument(course(STAGE_B, withExtra('p2', 'other')));
+      await expect(checkout(original, STAGE_B)).rejects.toThrow();
+      expect(titles(await store.loadDocument(STAGE_B))[1]).toBe('Light reactions+other');
+    });
+
+    it('preserves an editor save concurrent with checkout', async () => {
+      const store = documents();
+      await store.saveDocument(course(STAGE, base));
+      const original = (await snapshot())!.id;
+      await store.saveDocument(course(STAGE, withExtra('p2', 'video')));
+      const switched = Promise.withResolvers<void>();
+      const commit = Promise.withResolvers<void>();
+      const checkingOut = db.withTransaction(async (tx) => {
+        await checkoutCourseVersion(
+          { queryable: tx, withTransaction: (body) => body(tx) },
+          { ownerId: OWNER, stageId: STAGE, versionId: original },
+        );
+        switched.resolve();
+        await commit.promise;
+      });
+      await switched.promise;
+      // A reader on another connection still sees the source branch until commit.
+      const visible = await pool.query(
+        "SELECT data->'content'->>'extra' AS media FROM document_scenes WHERE stage_id=$1 AND id='p2'",
+        [STAGE],
+      );
+      const edit = store.putScene(STAGE, course(STAGE, withExtra('p3', 'hand edit')).scenes[2]!);
+      commit.resolve();
+      await Promise.all([checkingOut, edit]);
+      expect(visible.rows[0].media).toBe('video');
+      expect(titles(await store.loadDocument(STAGE))).toEqual([
+        'What it is',
+        'Light reactions',
+        'Calvin cycle+hand edit',
       ]);
-      expect(titles(await documents.loadDocument(STAGE))).toEqual([
-        'What it is+hand-edited title',
+      expect((await snapshot())!.id).not.toBe(original);
+    });
+  });
+
+  /** Every callback reopens the durable, leased tree just as a fresh worker does. */
+  async function conversation() {
+    const store = new PgAgentSessionStore(db.queryable, { withTransaction: db.withTransaction });
+    const sessionId = 'lesson';
+    const worker = 'worker-1';
+    const meta = await store.createSession({
+      id: sessionId,
+      ownerId: OWNER,
+      prompt: 'lesson',
+      stageId: STAGE,
+    });
+    const claim = await store.claimNextSession(worker, 1, {
+      leaseTtlMs: 60_000,
+      maxAttempts: 5,
+      sessionId,
+    });
+    const withSession = <T>(work: (deps: CourseVersionDeps) => Promise<T>) =>
+      db.withTransaction(async (tx) => {
+        const ownerId = await forwardOwnerWrite(tx, OWNER);
+        const pinned = agentSessionStoreIn(tx);
+        await pinned.assertActiveLease(sessionId, worker, claim!.attempt, tx);
+        const handle = await pinned.openEntryTree(sessionId, worker, claim!.attempt);
+        return work({
+          sessionId,
+          ownerId,
+          defaultStageId: STAGE,
+          session: new Session(AgentSessionEntryStorage.fromHandle(meta, handle)),
+          writeEntry: (write) => write(),
+          db: { queryable: tx, withTransaction: (body) => body(tx) },
+        });
+      });
+    return {
+      message: (text: string, seq?: number) =>
+        withSession(({ session }) => appendUser(session, text, seq)),
+      reply: (text: string) => withSession(({ session }) => appendAssistant(session, text)),
+      record: (phase: 'before_run' | 'after_run', extraStageIds?: string[]) =>
+        withSession((deps) => recordCourseVersions(deps, { phase, extraStageIds })),
+      entries: () => withSession(({ session }) => session.getEntries()),
+      leaf: () => withSession(({ session }) => session.getLeafId()),
+      context: () => withSession(({ session }) => session.buildContext()),
+      branch: (
+        seq: number,
+        data: BranchRequestData,
+        options: { mediaPending?: boolean; createdStageIds?: Set<string> } = {},
+      ) =>
+        applyBranchRequests(
+          {
+            withTransaction: withSession,
+            hasPendingMedia: () => options.mediaPending === true,
+            createdStageIds: options.createdStageIds,
+          },
+          [{ seq, data }],
+        ),
+    };
+  }
+
+  describe('branches of a conversation on PostgreSQL', () => {
+    it('edits, regenerates and switches with each branch retaining its own hand edits', async () => {
+      const doc = documents();
+      await doc.saveDocument(course(STAGE, base));
+      const session = await conversation();
+      await session.message('lesson');
+      await session.reply('three pages');
+      await session.record('after_run');
+      await session.record('before_run');
+      const marks = (await session.entries()).filter(
+        (e) => e.type === 'custom' && e.customType === COURSE_VERSIONS_ENTRY,
+      );
+      expect(marks).toHaveLength(1);
+      await doc.saveDocument(course(STAGE, withExtra('p1', 'hand edit')));
+      await session.record('before_run');
+      await session.message('add media', 7);
+      await session.reply('video');
+      const setMedia = (media: string) =>
+        doc.putScene(STAGE, course(STAGE, withExtra('p2', media)).scenes[1]!);
+      await setMedia('video');
+      await session.record('after_run');
+
+      expect(
+        (await session.branch(20, { op: 'regenerate', targetSeq: 7 })).outcomes[0]?.status,
+      ).toBe('applied');
+      expect(titles(await doc.loadDocument(STAGE))).toEqual([
+        'What it is+hand edit',
+        'Light reactions',
+        'Calvin cycle',
+      ]);
+      await session.reply('animation');
+      await setMedia('animation');
+      await session.record('after_run');
+      expect(
+        (await session.branch(25, { op: 'switch', targetSeq: 7, variant: 'orig' })).outcomes[0]
+          ?.status,
+      ).toBe('applied');
+      expect(titles(await doc.loadDocument(STAGE))[1]).toBe('Light reactions+video');
+      const context = await session.context();
+      expect(
+        context.messages.map((message) => {
+          if (message.role === 'user') return message.content;
+          if (message.role === 'assistant' && message.content[0]?.type === 'text')
+            return message.content[0].text;
+          return message.role;
+        }),
+      ).toEqual(['lesson', 'three pages', 'add media', 'video']);
+      await doc.putScene(STAGE, course(STAGE, withExtra('p3', 'note')).scenes[2]!);
+      // A retry after checkout but before its lifecycle receipt must not undo this edit.
+      expect(
+        (await session.branch(25, { op: 'switch', targetSeq: 7, variant: 'orig' })).outcomes[0]
+          ?.status,
+      ).toBe('applied');
+      expect(titles(await doc.loadDocument(STAGE))[2]).toBe('Calvin cycle+note');
+      expect(
+        (await session.branch(26, { op: 'switch', targetSeq: 7, variant: 'orig' })).outcomes[0]
+          ?.status,
+      ).toBe('applied');
+      expect(titles(await doc.loadDocument(STAGE))[2]).toBe('Calvin cycle+note');
+      await session.branch(27, { op: 'switch', targetSeq: 7, variant: 20 });
+      expect(titles(await doc.loadDocument(STAGE))).toEqual([
+        'What it is+hand edit',
         'Light reactions+animation',
         'Calvin cycle',
       ]);
-      await applyBranchRequests(deps, [
-        { seq: 27, data: { op: 'switch', targetSeq: 7, variant: 'orig' } },
-      ]);
-      expect(titles(await documents.loadDocument(STAGE))).toEqual([
-        'What it is+hand-edited title',
+      await session.branch(28, { op: 'switch', targetSeq: 7, variant: 'orig' });
+      expect(titles(await doc.loadDocument(STAGE))).toEqual([
+        'What it is+hand edit',
         'Light reactions+video',
         'Calvin cycle+note',
       ]);
-
-      // Edit ③: the conversation goes to just before it, and so does the course.
-      const edited = await applyBranchRequests(deps, [
-        { seq: 30, data: { op: 'edit', targetSeq: 7 } },
-      ]);
-      expect(edited.outcomes).toMatchObject([{ requestSeq: 30, op: 'edit', status: 'applied' }]);
-      expect(titles(await documents.loadDocument(STAGE))).toEqual([
-        'What it is+hand-edited title',
+      expect((await session.branch(30, { op: 'edit', targetSeq: 7 })).outcomes[0]?.status).toBe(
+        'applied',
+      );
+      expect(titles(await doc.loadDocument(STAGE))).toEqual([
+        'What it is+hand edit',
         'Light reactions',
         'Calvin cycle',
       ]);
-      const editLeaf = await session.getLeafId();
-      const leafEntry = storage.entries.find((entry) => entry.id === editLeaf);
-      expect(leafEntry).toMatchObject({ type: 'custom', customType: COURSE_VERSIONS_ENTRY });
     });
 
-    it('changes nothing when a course cannot be restored', async () => {
-      const documents = new MemoryDocuments();
-      await documents.saveDocument(course(STAGE, base));
-      await documents.saveDocument(course(STAGE_B, base));
-      const { deps, session, storage } = depsFor(documents);
-      await appendUser(session, 'make two lessons');
-      await appendAssistant(session, 'two courses');
-      await recordCourseVersions(deps, { phase: 'after_run', extraStageIds: [STAGE_B] });
-      await appendUser(session, 'add a video to both', 7);
-      await appendAssistant(session, 'added two videos');
-      await documents.saveDocument(course(STAGE, withExtra('p2', 'video')));
-      await documents.saveDocument(course(STAGE_B, withExtra('p2', 'video')));
-      await recordCourseVersions(deps, { phase: 'after_run' });
-      const leafBefore = await session.getLeafId();
+    it.each([false, true])(
+      'checks the missing baseline of a second course (created by this session: %s)',
+      async (created) => {
+        const doc = documents();
+        const session = await conversation();
+        await doc.saveDocument(course(STAGE, base));
+        if (!created) await doc.saveDocument(course(STAGE_B, base));
+        await session.message('make a lesson');
+        await session.reply('done');
+        await session.record('after_run');
+        await session.message('add a video and illustrate it in a second course', 7);
+        await session.reply('done');
+        for (const id of [STAGE, STAGE_B])
+          await doc.saveDocument(course(id, withExtra('p2', 'video')));
+        await session.record('after_run', [STAGE_B]);
+        const before = await session.leaf();
+        const [outcome] = (
+          await session.branch(
+            20,
+            { op: 'regenerate', targetSeq: 7 },
+            {
+              createdStageIds: new Set(created ? [STAGE_B] : []),
+            },
+          )
+        ).outcomes;
+        if (created) {
+          expect(outcome?.status).toBe('applied');
+          expect(titles(await doc.loadDocument(STAGE))[1]).toBe('Light reactions');
+        } else {
+          expect(outcome).toMatchObject({ status: 'rejected', reason: 'version_unavailable' });
+          expect(await session.leaf()).toBe(before);
+          expect(titles(await doc.loadDocument(STAGE))[1]).toBe('Light reactions+video');
+        }
+        expect(titles(await doc.loadDocument(STAGE_B))[1]).toBe('Light reactions+video');
+      },
+    );
 
-      // The first course is written back, the second fails.
-      documents.failSave(2);
-      const failed = await applyBranchRequests(deps, [
-        { seq: 20, data: { op: 'regenerate', targetSeq: 7 } },
-      ]);
-      expect(failed).toEqual({
-        outcomes: [
-          { requestSeq: 20, op: 'regenerate', status: 'rejected', reason: 'checkout_failed' },
-        ],
-        regenerated: false,
-      });
-      // Both courses are as the request found them, and so is the conversation:
-      // its leaf is the request's before-switch entry on the same branch, and
-      // no empty reply was left for a later switch to land on.
-      expect(titles(await documents.loadDocument(STAGE))[1]).toBe('Light reactions+video');
-      expect(titles(await documents.loadDocument(STAGE_B))[1]).toBe('Light reactions+video');
-      const leafAfter = await session.getLeafId();
-      expect(storage.entries.find((entry) => entry.id === leafAfter)).toMatchObject({
-        parentId: leafBefore,
-        customType: COURSE_VERSIONS_ENTRY,
-        data: { phase: 'before_switch', requestSeq: 20 },
-      });
+    it('restores the earliest before-run state of a course first referenced on a later turn', async () => {
+      const doc = documents();
+      const session = await conversation();
+      for (const id of [STAGE, STAGE_B]) await doc.saveDocument(course(id, base));
+      await session.message('make a lesson');
+      await session.reply('done');
+      await session.record('after_run');
+      await session.message('change the first course', 7);
+      await session.reply('done');
+      await doc.saveDocument(course(STAGE, withExtra('p2', 'first')));
+      await session.record('after_run');
+      await session.record('before_run', [STAGE_B]);
+      await session.message('now edit the existing second course', 11);
+      await session.reply('done');
+      await doc.saveDocument(course(STAGE_B, withExtra('p2', 'second')));
+      await session.record('after_run', [STAGE_B]);
       expect(
-        storage.entries.some(
-          (entry) => (entry as { customType?: string }).customType === REPLY_VARIANT_ENTRY,
-        ),
-      ).toBe(false);
-
-      // Once saving works again, the same request lands.
-      const retried = await applyBranchRequests(deps, [
-        { seq: 21, data: { op: 'regenerate', targetSeq: 7 } },
-      ]);
-      expect(retried.outcomes).toMatchObject([{ requestSeq: 21, status: 'applied' }]);
-      expect(titles(await documents.loadDocument(STAGE))[1]).toBe('Light reactions');
-      expect(titles(await documents.loadDocument(STAGE_B))[1]).toBe('Light reactions');
+        (await session.branch(20, { op: 'regenerate', targetSeq: 7 })).outcomes[0]?.status,
+      ).toBe('applied');
+      for (const id of [STAGE, STAGE_B])
+        expect(titles(await doc.loadDocument(id))[1]).toBe('Light reactions');
     });
 
-    it('applies a request again after a claim died part-way, without recording on the wrong branch', async () => {
-      const documents = new MemoryDocuments();
-      await documents.saveDocument(course(STAGE, base));
-      const { deps, session } = depsFor(documents);
-      await appendUser(session, 'make a photosynthesis lesson');
-      await appendAssistant(session, 'three pages');
-      await recordCourseVersions(deps, { phase: 'after_run', status: 'succeeded' });
-      await appendUser(session, 'add a video to page 2', 7);
-      await appendAssistant(session, 'added a video');
-      await documents.saveDocument(course(STAGE, withExtra('p2', 'video')));
-      const [video] = await recordCourseVersions(deps, { phase: 'after_run', status: 'succeeded' });
-      await applyBranchRequests(deps, [{ seq: 20, data: { op: 'regenerate', targetSeq: 7 } }]);
-      await appendAssistant(session, 'added an animation');
-      await documents.saveDocument(course(STAGE, withExtra('p2', 'animation')));
-      await recordCourseVersions(deps, { phase: 'after_run', status: 'succeeded' });
-
-      // A claim got this far with switch #25 before it died: the before-switch
-      // entry is written and the course is already the original reply's, but
-      // the leaf is still on the regenerated reply.
-      await recordCourseVersions(deps, { phase: 'before_switch', requestSeq: 25 });
-      await checkoutCourseVersion(db, { versionId: video!.versionId, stageId: STAGE, documents });
-
-      const again = await applyBranchRequests(deps, [
-        { seq: 25, data: { op: 'switch', targetSeq: 7, variant: 'orig' } },
-      ]);
-      expect(again.outcomes).toMatchObject([{ requestSeq: 25, status: 'applied' }]);
-      expect(titles(await documents.loadDocument(STAGE))[1]).toBe('Light reactions+video');
-
-      // The half-switched course was not recorded onto the regenerated reply's
-      // branch: it still has its own course.
-      await applyBranchRequests(deps, [
-        { seq: 26, data: { op: 'switch', targetSeq: 7, variant: 20 } },
-      ]);
-      expect(titles(await documents.loadDocument(STAGE))[1]).toBe('Light reactions+animation');
-    });
-
-    it('does not bring a deleted course back', async () => {
-      const documents = new MemoryDocuments();
-      await documents.saveDocument(course(STAGE, base));
-      const { deps, session } = depsFor(documents);
-      await appendUser(session, 'make a photosynthesis lesson');
-      await appendAssistant(session, 'three pages');
-      await recordCourseVersions(deps, { phase: 'after_run', status: 'succeeded' });
-      await appendUser(session, 'add a video to page 2', 7);
-      await appendAssistant(session, 'added a video');
-      await documents.saveDocument(course(STAGE, withExtra('p2', 'video')));
-      await recordCourseVersions(deps, { phase: 'after_run', status: 'succeeded' });
-
-      documents.documents.delete(STAGE);
-      const result = await applyBranchRequests(deps, [
-        { seq: 20, data: { op: 'regenerate', targetSeq: 7 } },
-      ]);
-      expect(result.outcomes).toMatchObject([
-        { requestSeq: 20, status: 'applied', checkedOut: [{ stageId: STAGE, outcome: 'missing' }] },
-      ]);
-      expect(await documents.loadDocument(STAGE)).toBeNull();
-    });
-
-    it('refuses to move while a media job could still patch the course', async () => {
-      const documents = new MemoryDocuments();
-      await documents.saveDocument(course(STAGE, base));
-      const { deps, session } = depsFor(documents);
-      await appendUser(session, 'first', 3);
-      await appendAssistant(session, 'done');
-      const result = await applyBranchRequests({ ...deps, hasPendingMedia: () => true }, [
-        { seq: 9, data: { op: 'regenerate', targetSeq: 3 } },
-      ]);
-      expect(result.outcomes).toEqual([
-        { requestSeq: 9, op: 'regenerate', status: 'rejected', reason: 'media_pending' },
-      ]);
-    });
-  });
-
-  describe('on the PostgreSQL entry tree, under a lease', () => {
-    it('keeps the branch and its course together across regenerate and switch', async () => {
-      await pool.query(
-        'TRUNCATE agent_session_entries, agent_session_events, agent_sessions CASCADE',
-      );
-      const store = new PgAgentSessionStore(pool as unknown as Queryable, {
-        withTransaction: transactionFor(pool),
-      });
-      await store.createSession({ id: 'tree-1', ownerId: OWNER, prompt: 'lesson', stageId: STAGE });
-      const claim = await store.claimNextSession('worker-1', 1, {
-        leaseTtlMs: 60_000,
-        maxAttempts: 5,
-        sessionId: 'tree-1',
-      });
-      expect(claim?.id).toBe('tree-1');
-      const handle = await store.openEntryTree('tree-1', 'worker-1', claim!.attempt);
-      const session = new Session(
-        AgentSessionEntryStorage.fromHandle({ id: 'tree-1', createdAt: Date.now() }, handle),
-      );
-      const documents = new MemoryDocuments();
-      await documents.saveDocument(course(STAGE, base));
-      const deps = {
-        sessionId: 'tree-1',
-        ownerId: OWNER,
-        defaultStageId: STAGE,
-        session,
-        writeEntry: (write: () => Promise<void>) => write(),
-        documents,
-        db,
-        hasPendingMedia: () => false,
-      };
-
-      await appendUser(session, 'lesson');
-      await appendAssistant(session, 'three pages');
-      await recordCourseVersions(deps, { phase: 'after_run' });
-      await recordCourseVersions(deps, { phase: 'before_run' });
-      await appendUser(session, 'add a video', 5);
-      await appendAssistant(session, 'video added');
-      await documents.saveDocument(course(STAGE, withExtra('p2', 'video')));
-      await recordCourseVersions(deps, { phase: 'after_run' });
-
-      await applyBranchRequests(deps, [{ seq: 8, data: { op: 'regenerate', targetSeq: 5 } }]);
-      expect(titles(await documents.loadDocument(STAGE))[1]).toBe('Light reactions');
-      await appendAssistant(session, 'animation added');
-      await documents.saveDocument(course(STAGE, withExtra('p2', 'animation')));
-      await recordCourseVersions(deps, { phase: 'after_run' });
-
-      await applyBranchRequests(deps, [
-        { seq: 9, data: { op: 'switch', targetSeq: 5, variant: 'orig' } },
-      ]);
-      expect(titles(await documents.loadDocument(STAGE))[1]).toBe('Light reactions+video');
-      // The model's context on this branch is the original exchange only.
-      const context = await session.buildContext();
+    it('keeps hand edits to a course only the destination branch has named', async () => {
+      const doc = documents();
+      const session = await conversation();
+      const options = { createdStageIds: new Set([STAGE_B]) };
+      await doc.saveDocument(course(STAGE, base));
+      await session.message('make a lesson');
+      await session.reply('done');
+      await session.record('after_run');
+      await session.message('create a second course', 7);
+      await session.reply('created the second course');
+      await doc.saveDocument(course(STAGE_B, withExtra('p2', 'video')));
+      await session.record('after_run', [STAGE_B]);
       expect(
-        context.messages.map((message) =>
-          message.role === 'user'
-            ? String((message as { content: unknown }).content)
-            : ((message as { content: Array<{ text?: string }> }).content[0]?.text ?? ''),
-        ),
-      ).toEqual(['lesson', 'three pages', 'add a video', 'video added']);
+        (await session.branch(20, { op: 'regenerate', targetSeq: 7 }, options)).outcomes[0]?.status,
+      ).toBe('applied');
+      await session.reply('changed only the first course');
+      await session.record('after_run');
+      await doc.putScene(STAGE_B, course(STAGE_B, withExtra('p2', 'hand edit')).scenes[1]!);
+      expect(
+        (await session.branch(21, { op: 'switch', targetSeq: 7, variant: 'orig' }, options))
+          .outcomes[0]?.status,
+      ).toBe('applied');
+      expect(titles(await doc.loadDocument(STAGE_B))[1]).toBe('Light reactions+video');
+      expect(
+        (await session.branch(22, { op: 'switch', targetSeq: 7, variant: 20 }, options)).outcomes[0]
+          ?.status,
+      ).toBe('applied');
+      expect(titles(await doc.loadDocument(STAGE_B))[1]).toBe('Light reactions+hand edit');
+    });
 
-      // A fresh handle (a later claim) reads the same branch back.
-      const reopened = await store.openEntryTree('tree-1', 'worker-1', claim!.attempt);
-      const path = await reopened.getPathToRoot(await reopened.getLeafId());
-      expect(path.at(-1)?.type).toBe('custom');
+    it('rolls back every course and the tree if the second restore fails', async () => {
+      const doc = documents();
+      const session = await conversation();
+      for (const stageId of [STAGE, STAGE_B]) await doc.saveDocument(course(stageId, base));
+      await session.message('two lessons');
+      await session.reply('three pages each');
+      await session.record('after_run', [STAGE_B]);
+      await session.message('add videos', 7);
+      await session.reply('two videos');
+      for (const stageId of [STAGE, STAGE_B])
+        await doc.saveDocument(course(stageId, withExtra('p2', 'video')));
+      await session.record('after_run');
+      const before = await session.leaf();
+      const initial = await manifest();
+      await pool.query(`ALTER TABLE document_scenes ADD CONSTRAINT reject_second_restore
+        CHECK (stage_id <> '${STAGE_B}' OR id <> 'p2' OR data->'content'->>'extra' IS NOT NULL) NOT VALID`);
+      try {
+        expect(
+          (await session.branch(20, { op: 'regenerate', targetSeq: 7 })).outcomes,
+        ).toMatchObject([{ status: 'rejected', reason: 'checkout_failed' }]);
+      } finally {
+        await pool.query('ALTER TABLE document_scenes DROP CONSTRAINT reject_second_restore');
+      }
+      expect(await session.leaf()).toBe(before);
+      expect(await manifest()).toEqual(initial);
+      for (const stageId of [STAGE, STAGE_B])
+        expect(titles(await doc.loadDocument(stageId))[1]).toBe('Light reactions+video');
+      expect(
+        (await session.branch(21, { op: 'regenerate', targetSeq: 7 })).outcomes[0]?.status,
+      ).toBe('applied');
+      for (const stageId of [STAGE, STAGE_B])
+        expect(titles(await doc.loadDocument(stageId))[1]).toBe('Light reactions');
+    });
+
+    it('leaves a deleted course retired and refuses to switch during pending media', async () => {
+      const doc = documents();
+      await doc.saveDocument(course(STAGE, base));
+      const session = await conversation();
+      await session.message('lesson');
+      await session.reply('three pages');
+      await session.record('after_run');
+      await session.message('add media', 7);
+      await session.reply('video');
+      const before = await session.leaf();
+      expect(
+        (await session.branch(12, { op: 'regenerate', targetSeq: 7 }, { mediaPending: true }))
+          .outcomes[0]?.reason,
+      ).toBe('media_pending');
+      expect(await session.leaf()).toBe(before);
+      await doc.deleteDocument(STAGE);
+      expect((await session.branch(13, { op: 'regenerate', targetSeq: 7 })).outcomes).toMatchObject(
+        [{ status: 'applied', checkedOut: [{ stageId: STAGE, outcome: 'missing' }] }],
+      );
+      expect(await doc.loadDocument(STAGE)).toBeNull();
+    });
+
+    it('leaves an unversioned historic follow-up and its live course together', async () => {
+      const doc = documents();
+      await doc.saveDocument(course(STAGE, base));
+      const session = await conversation();
+      await session.message('lesson');
+      await session.reply('three pages');
+      await session.message('change page two', 7);
+      await session.reply('done');
+      const before = await session.leaf();
+      expect((await session.branch(20, { op: 'edit', targetSeq: 7 })).outcomes).toMatchObject([
+        { status: 'rejected', reason: 'version_unavailable' },
+      ]);
+      expect(await session.leaf()).toBe(before);
+      expect((await pool.query('SELECT id FROM course_versions')).rows).toEqual([]);
+      expect(titles(await doc.loadDocument(STAGE))[1]).toBe('Light reactions');
     });
   });
 
@@ -582,7 +653,8 @@ describe.skipIf(!contractUrl)('course versions (#1317 prototype)', () => {
       await insert(3, 'session_resumed', { reason: 'follow_up', branches: [{ requestSeq: 2 }] });
       await insert(4, 'branch_request', { op: 'switch', targetSeq: 0, variant: 'orig' });
       await insert(5, 'message_update', {});
-      const pending = await readPendingBranchRequests(pool as unknown as Queryable, 's1');
+      const store = new PgAgentSessionStore(db.queryable, { withTransaction: db.withTransaction });
+      const pending = (await readAgentMessageLog(store, 's1')).pendingBranches;
       expect(pending).toEqual([{ seq: 4, data: { op: 'switch', targetSeq: 0, variant: 'orig' } }]);
     });
   });

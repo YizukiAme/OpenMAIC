@@ -62,7 +62,6 @@ import {
   composerTransferHasImages,
 } from '@/lib/workbench/composer-image-transfer';
 import {
-  branchWorkbenchSession,
   cancelWorkbenchSession,
   postWorkbenchMessage,
   recoverTerminalCancelStatus,
@@ -75,7 +74,8 @@ import {
   type WorkbenchMaterial,
 } from '@/lib/workbench/session-store';
 import { initialBranchState, projectBranchChat } from '@/lib/workbench/branch-fold';
-import { useCourseTimeline } from '@/lib/edit/course-timeline';
+import { changeWorkbenchBranch, courseForSwitch } from '@/lib/workbench/change-branch';
+import { flushStageSave, useStageStore } from '@/lib/store/stage';
 import {
   AtSignButton,
   AttachButton,
@@ -98,7 +98,6 @@ import {
 import { resolveComposerMenu } from '@/lib/workbench/composer-menus';
 import {
   isComposerLive,
-  isRunLive,
   shouldPromptForRefInstruction,
   shouldDropPendingSend,
   shouldDropPendingStop,
@@ -132,29 +131,6 @@ const NO_ELEMENT_REFS: ElementRef[] = [];
 const NO_COURSE_REFS: CourseRef[] = [];
 /** How long another conversation's transcript may stay up while the next one loads. */
 const TRANSCRIPT_RETENTION_GRACE_MS = 1_000;
-
-/** How long a branch request waits for the run it stopped to end (#1317 prototype). */
-const BRANCH_STOP_TIMEOUT_MS = 30_000;
-
-/** Resolve true once the attached session's run is no longer live, false on timeout. */
-function waitForRunEnd(timeoutMs: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    let settled = false;
-    let unsubscribe: () => void = () => {};
-    const finish = (ended: boolean) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      unsubscribe();
-      resolve(ended);
-    };
-    const timer = setTimeout(() => finish(false), timeoutMs);
-    unsubscribe = useWorkbenchStore.subscribe((state) => {
-      if (!isRunLive(state.status)) finish(true);
-    });
-    if (!isRunLive(useWorkbenchStore.getState().status)) finish(true);
-  });
-}
 
 export function WorkbenchChat({
   hosted = false,
@@ -202,6 +178,7 @@ export function WorkbenchChat({
 }) {
   const { t } = useI18n();
   const sessionId = useWorkbenchStore((s) => s.sessionId);
+  const openStage = useStageStore((s) => s.stage?.id);
   /**
    * No conversation yet — the workspace is showing an empty composer and the
    * session will be minted by the first message (see
@@ -219,8 +196,6 @@ export function WorkbenchChat({
    */
   const ownerAttached = conversation === undefined || conversation === composerOwnerId;
   const canSend = ownerAttached && (sessionId !== null || draftConversation !== null);
-  // The fold keeps every branch's nodes; the rail shows the branch on screen
-  // (#1317 prototype). A conversation that never branched projects to itself.
   const foldedChat = useWorkbenchStore((s) => s.chat);
   const branchState = useWorkbenchStore((s) => s.branch);
   const branchView = useMemo(
@@ -367,7 +342,13 @@ export function WorkbenchChat({
    * asked for and nobody could find again.
    */
   const [mentionDismissed, setMentionDismissed] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [sending, setBusy] = useState(false);
+  const [branchPending, setBranchPending] = useState(false);
+  const branchInFlight = useRef(false);
+  const busy = sending || branchPending;
+  // A worker that failed before checkout can ask for a new message to retry.
+  // Keep another branch request out while that one still awaits its receipt.
+  const branchBusy = busy || Boolean(branchState?.inbox.length);
   /**
    * Where the caret goes after a skill handle is written into the draft, applied
    * once the input has taken the new value. A ref, not state:
@@ -482,6 +463,11 @@ export function WorkbenchChat({
   const leaveConversation = () => {
     createdHere.current = null;
     conversationTurn.current += 1;
+    if (branchInFlight.current) {
+      branchInFlight.current = false;
+      setBranchPending(false);
+      useWorkbenchStore.setState({ branchEditStageId: null });
+    }
     materials.leaveUploads();
     if (sendingMaterials.current) {
       materials.removeSent(sendingMaterials.current);
@@ -1067,81 +1053,73 @@ export function WorkbenchChat({
     }
   }, [busy, ownerAttached, pendingStop, sessionId, t]);
 
-  // ── Edit-and-resend (#1317 prototype) ──────────────────────────────────
-  //
-  // Every control on the timeline goes through here. A run that is still
-  // writing is stopped first (the cancel route): its half-built reply and course
-  // are kept as a version of their own, and the request is sent once the run
-  // has ended. The rail stays usable meanwhile; a stop that does not land in
-  // time says so instead of waiting forever.
-  const [branchPending, setBranchPending] = useState(false);
-  const branchInFlight = useRef(false);
   const requestBranch = useCallback(
     async (request: WorkbenchBranchRequest): Promise<boolean> => {
-      if (!sessionId || !ownerAttached || branchInFlight.current) return false;
-      const target = sessionId;
+      if (!sessionId || !ownerAttached || branchBusy || replaying || branchInFlight.current)
+        return false;
+      const atTurn = conversationTurn.current;
+      const stillHere = () => conversationTurn.current === atTurn;
       branchInFlight.current = true;
       setBranchPending(true);
+      const session = useWorkbenchStore.getState();
+      if (
+        openStage &&
+        (session.stageId === openStage || session.touchedStageIds.includes(openStage))
+      ) {
+        useWorkbenchStore.setState({ branchEditStageId: openStage });
+      }
       try {
-        if (isRunLive(useWorkbenchStore.getState().status)) {
-          toast.info(t('workbench.chat.branchStopping'));
-          try {
-            await cancelWorkbenchSession(target);
-          } catch (err) {
-            if (!recoverTerminalCancelStatus(target, err)) throw err;
-          }
-          if (!(await waitForRunEnd(BRANCH_STOP_TIMEOUT_MS))) {
-            toast.error(t('workbench.chat.branchStopTimeout'));
-            return false;
-          }
+        const receipt = await changeWorkbenchBranch(sessionId, request, {
+          pendingSend,
+          stillHere,
+          onStopping: () => toast.info(t('workbench.chat.branchStopping')),
+        });
+        if (!stillHere() || receipt?.status !== 'applied') return false;
+        if (request.op === 'switch' && navigation) {
+          const course = courseForSwitch(
+            useWorkbenchStore.getState().chat,
+            receipt.checkedOut,
+            navigation.activeCourseId,
+          );
+          if (course && course !== navigation.activeCourseId) navigation.openCourse(course);
         }
-        await branchWorkbenchSession(target, request);
         return true;
       } catch (err) {
+        if (!stillHere()) return false;
         const code = err instanceof WorkbenchApiError ? err.errorCode : undefined;
-        if (code === 'MEDIA_PENDING') toast.warning(t('workbench.chat.branchMediaPending'));
-        else if (code === 'SESSION_BUSY') toast.error(t('workbench.chat.branchStopTimeout'));
+        if (code === 'BRANCH_QUEUED') toast.info(t('workbench.chat.branchQueued'));
+        else if (code === 'MEDIA_PENDING') toast.warning(t('workbench.chat.branchMediaPending'));
+        else if (code === 'QUESTION_PENDING') toast.info(t('workbench.chat.branchQuestionPending'));
+        else if (code === 'MESSAGE_PENDING') toast.info(t('workbench.chat.branchMessagePending'));
+        else if (code === 'SESSION_BUSY') toast.error(t('workbench.chat.branchBusy'));
+        else if (code === 'STOP_TIMEOUT') toast.error(t('workbench.chat.branchStopTimeout'));
+        else if (code === 'COURSE_SAVE_FAILED') toast.error(t('workbench.chat.branchSaveFailed'));
         else toast.error(t('workbench.chat.branchFailed'));
         return false;
       } finally {
-        branchInFlight.current = false;
-        setBranchPending(false);
+        if (stillHere()) {
+          branchInFlight.current = false;
+          setBranchPending(false);
+          useWorkbenchStore.setState({ branchEditStageId: null });
+        }
       }
     },
-    [ownerAttached, sessionId, t],
+    [branchBusy, navigation, openStage, ownerAttached, pendingSend, replaying, sessionId, t],
   );
   const timelineBranch = useMemo<TimelineBranch>(
     () => ({
       segments: branchView.segments,
       forks: branchView.forks,
-      disabled: branchPending || !ownerAttached,
-      onEdit: (userSeq, text, node) =>
-        requestBranch({
-          op: 'edit',
-          targetSeq: userSeq,
-          text,
-          ...(node.elementRefs?.length ? { elementRefs: node.elementRefs } : {}),
-          ...(node.courseRefs?.length ? { courseRefs: node.courseRefs } : {}),
-        }),
+      disabled: branchBusy || replaying || !ownerAttached,
+      // The server retains the original attachments, element and course references.
+      onEdit: (userSeq, text) => requestBranch({ op: 'edit', targetSeq: userSeq, text }),
       onRegenerate: (userSeq) => void requestBranch({ op: 'regenerate', targetSeq: userSeq }),
       onSwitchUser: (userSeq) => void requestBranch({ op: 'switch', targetSeq: userSeq }),
       onSwitchReply: (userSeq, variant) =>
         void requestBranch({ op: 'switch', targetSeq: userSeq, variant }),
     }),
-    [branchView, branchPending, ownerAttached, requestBranch],
+    [branchView, branchBusy, replaying, ownerAttached, requestBranch],
   );
-  // A branch change writes another version of the course over the live one, so
-  // an undo step recorded against the old content would land on the wrong one.
-  // Replaying a log is not a change: it only catches the counter up.
-  const branchEpoch = branchState?.epoch ?? 0;
-  const seenBranchEpoch = useRef(branchEpoch);
-  useEffect(() => {
-    if (branchEpoch === seenBranchEpoch.current) return;
-    seenBranchEpoch.current = branchEpoch;
-    if (replaying) return;
-    const timeline = useCourseTimeline.getState();
-    for (const stageId of Object.keys(timeline.lines)) timeline.clearCourse(stageId);
-  }, [branchEpoch, replaying]);
 
   useDoubleEscapeStop({
     generating: live && !busy && !pendingStop && !!sessionId && ownerAttached && !covered,
@@ -1196,6 +1174,22 @@ export function WorkbenchChat({
         // workspace navigates to it. Everything staged rides along — the draft
         // path posts an ordinary message, so refs and materials are not a
         // special case.
+        const attached = useWorkbenchStore.getState();
+        if (
+          openStage &&
+          (openStage === attached.stageId ||
+            attached.touchedStageIds.includes(openStage) ||
+            courses.some((course) => course.stageId === openStage))
+        ) {
+          await flushStageSave();
+          if (superseded())
+            return {
+              accepted: false,
+              elementRefsAccepted: false,
+              courseRefsAccepted: false,
+              superseded: true,
+            };
+        }
         const result = sessionId
           ? {
               accepted: true,
@@ -1263,7 +1257,7 @@ export function WorkbenchChat({
         }
       }
     },
-    [busy, canSend, draftConversation, sessionId, status, t],
+    [busy, canSend, draftConversation, openStage, sessionId, status, t],
   );
 
   /**
@@ -1439,6 +1433,7 @@ export function WorkbenchChat({
               >
                 {displayedChat.length > 0 ? (
                   <ChatTimeline
+                    key={sessionId ?? composerOwnerId}
                     chat={displayedChat}
                     plan={displayedPlan}
                     turnActive={live}

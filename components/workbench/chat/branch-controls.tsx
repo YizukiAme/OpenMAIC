@@ -16,6 +16,7 @@ import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { ChevronLeft, ChevronRight, Pencil, RotateCcw } from 'lucide-react';
 import type { WorkbenchTranslator } from '@/lib/i18n/workbench';
 import type { BranchFork } from '@/lib/workbench/branch-fold';
+import { shouldSendComposerKey } from '@/lib/workbench/composer-keys';
 import { cn } from '@/lib/utils/cn';
 
 const styles = {
@@ -172,18 +173,20 @@ export function UserBubbleEditor({
     element.setSelectionRange(element.value.length, element.value.length);
   }, []);
   const trimmed = text.trim();
+  const canSubmit =
+    !sending && (trimmed.length > 0 || hasAttachments) && trimmed !== initialText.trim();
   const submit = async () => {
-    if (!trimmed || sending) return;
+    if (!canSubmit) return;
     setSending(true);
     const accepted = await onSubmit(trimmed);
     // An accepted edit unmounts this editor; a refused one keeps the text.
     if (!accepted) setSending(false);
   };
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (event.key === 'Escape') {
+    if (event.key === 'Escape' && !sending && !event.nativeEvent.isComposing) {
       event.preventDefault();
       onCancel();
-    } else if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+    } else if (shouldSendComposerKey(event)) {
       event.preventDefault();
       void submit();
     }
@@ -193,6 +196,7 @@ export function UserBubbleEditor({
       <div className={styles.editor}>
         <textarea
           ref={area}
+          readOnly={sending}
           className={styles.textarea}
           value={text}
           onChange={(event) => setText(event.target.value)}
@@ -206,13 +210,18 @@ export function UserBubbleEditor({
             </span>
           ) : null}
           <span className={styles.editorActions}>
-            <button type="button" className={styles.textButton} onClick={onCancel}>
+            <button
+              type="button"
+              className={styles.textButton}
+              disabled={sending}
+              onClick={onCancel}
+            >
               {t('workbench.chat.branchEditCancel')}
             </button>
             <button
               type="button"
               className={styles.primaryButton}
-              disabled={!trimmed || sending || trimmed === initialText.trim()}
+              disabled={!canSubmit}
               onClick={() => void submit()}
             >
               {t('workbench.chat.branchEditSend')}

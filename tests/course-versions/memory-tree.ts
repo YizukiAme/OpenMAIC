@@ -84,31 +84,6 @@ export async function appendAssistant(session: Session, text: string): Promise<s
   } as never);
 }
 
-/** A document store double holding whole documents, as the owner-bound store saves them. */
-export class MemoryDocuments {
-  readonly documents = new Map<string, MaicDocument>();
-  saves = 0;
-  private failingSave: number | null = null;
-
-  /** Make the `nth` save from now throw, once (a failed write saves nothing). */
-  failSave(nth: number): void {
-    this.failingSave = this.saves + nth;
-  }
-
-  async loadDocument(stageId: string): Promise<MaicDocument | null> {
-    const document = this.documents.get(stageId);
-    return document ? structuredClone(document) : null;
-  }
-  async saveDocument(document: MaicDocument): Promise<void> {
-    this.saves += 1;
-    if (this.saves === this.failingSave) {
-      this.failingSave = null;
-      throw new Error('save failed');
-    }
-    this.documents.set(document.stage.id, structuredClone(document));
-  }
-}
-
 export function course(
   stageId: string,
   pages: Array<{ id: string; title: string; extra?: string }>,
@@ -121,7 +96,7 @@ export function course(
       type: 'slide',
       title: page.title,
       order,
-      content: { extra: page.extra ?? null },
+      content: { type: 'slide', canvas: { elements: [] }, extra: page.extra ?? null },
     })) as never,
   };
 }

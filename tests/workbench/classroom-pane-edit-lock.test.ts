@@ -9,6 +9,7 @@ import { useStageStore } from '@/lib/store/stage';
 import { readClassroomMode, writeClassroomMode } from '@/lib/workbench/classroom-mode';
 
 const probe = vi.hoisted(() => ({
+  changingCourse: null as string | null,
   states: [] as WorkbenchPanelState[],
 }));
 const setPlaybackOn = vi.fn();
@@ -28,7 +29,9 @@ vi.mock('@/components/workbench/workspace/WorkspaceCourseTabs', () => ({
 }));
 vi.mock('@/lib/workbench/session-store', () => ({
   useWorkbenchStore: (selector: (state: { setPlaybackOn: () => void }) => unknown) =>
-    selector({ setPlaybackOn }),
+    selector({ setPlaybackOn, branchEditStageId: probe.changingCourse } as {
+      setPlaybackOn: () => void;
+    }),
 }));
 
 import { WorkspaceClassroomPane } from '@/components/workbench/workspace/WorkspaceClassroomPane';
@@ -82,6 +85,7 @@ async function click(mode: string) {
 beforeEach(() => {
   props = { courseId: 'stage-1', hidden: false, fullscreen: false, readOnly: false };
   probe.states.length = 0;
+  probe.changingCourse = null;
   setPlaybackOn.mockClear();
   onCloseCourse.mockClear();
   localStorage.clear();
@@ -100,6 +104,17 @@ afterEach(async () => {
 });
 
 describe('classroom tab modes', () => {
+  it('pauses edits on the course being checked out and returns to the chosen editor mode', async () => {
+    await render();
+    await click('editing');
+    probe.changingCourse = 'stage-1';
+    await render({ fullscreen: true });
+    expect(button('editing').disabled).toBe(true);
+    expect(chrome()).toBe('playback');
+    probe.changingCourse = null;
+    await render({ fullscreen: false });
+    expect(chrome()).toBe('edit');
+  });
   it('starts in learning and switches in the same pane', async () => {
     await render();
     expect(chrome()).toBe('playback');

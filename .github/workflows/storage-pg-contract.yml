@@ -108,6 +108,8 @@ jobs:
             tests/persistence/workspace-model-config.pg.test.ts \
             tests/server/agents/owner-agents.pg.test.ts \
             tests/persistence/runtime-tombstone-collision.pg.test.ts \
+            tests/course-versions/course-versions.pg.test.ts \
+            tests/agent-runtime/branch-admission.pg.test.ts \
             tests/agent-runtime/event-notify.pg.test.ts \
             tests/agent-runtime/park-attempt-budget.pg.test.ts \
             tests/agent-runtime/session-events-live.pg.test.ts \

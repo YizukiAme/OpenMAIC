@@ -202,6 +202,8 @@ function trackCourseSwitches(): void {
     const departure = departures.get(arriving);
     if (!departure) return;
     departures.delete(arriving);
+    // A branch checkout can clear this course's history while it is away.
+    if (!useCourseTimeline.getState().lines[arriving]) return;
     const arrived: CourseDocument = {
       stage: state.stage,
       scenes: state.scenes,

@@ -43,6 +43,13 @@ const blankFold: WorkbenchFold = {
   stageId: null,
 };
 
+function applied(request: WorkbenchEvent) {
+  const { op } = request.data as { op: string };
+  const branches = [{ requestSeq: request.id, status: 'applied', op }];
+  return op === 'switch'
+    ? ev('session_end', { status: 'succeeded', note: 'branch requests only', branches }, 1)
+    : ev('session_resumed', { reason: 'follow_up', branches }, 1);
+}
 const reply = (text: string): WorkbenchEvent[] => [
   ev('message_start', { message: { role: 'assistant', content: [] } }),
   ev('message_end', { message: { role: 'assistant', content: [{ type: 'text', text }] } }),
@@ -83,6 +90,25 @@ describe('branch fold', () => {
     expect(userSeqOfNodeKey('e3-w')).toBeUndefined();
   });
 
+  it('resolves opening prompt sequence zero for an opening bubble persisted with materials', () => {
+    seq = 0;
+    const events = [
+      ev('user_message', {
+        text: 'lesson',
+        materials: [{ materialId: 'm', originalName: 'lesson.pdf' }],
+      }),
+      ev('session_start', { prompt: 'lesson' }, 1),
+      ...reply('first'),
+      ev('session_end', { status: 'succeeded' }, 1),
+    ];
+    const regen = ev('branch_request', { op: 'regenerate', targetSeq: 0 });
+    const state = [...events, regen, applied(regen), ...reply('second')].reduce(
+      foldEvent,
+      blankFold,
+    );
+    expect(onScreen(state)).toEqual(['> lesson', 'second']);
+    expect(forkOf(state, 'second')).toBe('2/2');
+  });
   it('shows a linear conversation as it always did', () => {
     const state = conversation().reduce(foldEvent, blankFold);
     expect(onScreen(state)).toEqual([
@@ -101,7 +127,7 @@ describe('branch fold', () => {
     const events = [
       ...base,
       regenerate,
-      ev('session_resumed', { reason: 'follow_up', branches: [{ requestSeq: regenerate.id }] }, 1),
+      applied(regenerate),
       ...reply('added an animation'),
       ev('session_end', { status: 'succeeded' }, 1),
     ];
@@ -114,14 +140,8 @@ describe('branch fold', () => {
     ]);
     expect(forkOf(state, 'added an animation')).toBe('2/2');
 
-    state = foldEvent(
-      state,
-      ev('branch_request', { op: 'switch', targetSeq: userSeq, variant: 'orig' }),
-    );
-    state = foldEvent(
-      state,
-      ev('session_end', { status: 'succeeded', note: 'branch requests only' }, 1),
-    );
+    const pick = ev('branch_request', { op: 'switch', targetSeq: userSeq, variant: 'orig' });
+    state = [pick, applied(pick)].reduce(foldEvent, state);
     expect(onScreen(state).at(-1)).toBe('added a video');
     expect(forkOf(state, 'added a video')).toBe('1/2');
 
@@ -133,11 +153,12 @@ describe('branch fold', () => {
   it('puts an edited message beside the original with its own reply', () => {
     const base = conversation();
     const userSeq = base.find((event) => event.type === 'user_message')!.id;
+    const edit = ev('branch_request', { op: 'edit', targetSeq: userSeq });
     const events = [
       ...base,
-      ev('branch_request', { op: 'edit', targetSeq: userSeq }),
+      edit,
       ev('user_message', { text: 'add a quiz to page 2', delivery: 'queued' }),
-      ev('session_resumed', { reason: 'follow_up' }, 1),
+      applied(edit),
       ...reply('added a quiz'),
       ev('session_end', { status: 'succeeded' }, 1),
     ];
@@ -150,7 +171,8 @@ describe('branch fold', () => {
     ]);
     expect(forkOf(state, 'add a quiz to page 2')).toBe('2/2');
 
-    state = foldEvent(state, ev('branch_request', { op: 'switch', targetSeq: userSeq }));
+    const pick = ev('branch_request', { op: 'switch', targetSeq: userSeq });
+    state = [pick, applied(pick)].reduce(foldEvent, state);
     expect(onScreen(state).slice(-2)).toEqual(['> add a video to page 2', 'added a video']);
   });
 
@@ -172,21 +194,21 @@ describe('branch fold', () => {
     expect(state.branch!.segments[stopped.segment!]?.endStatus).toBe('cancelled');
   });
 
-  it('undoes a request the runner rejected, and says so', () => {
+  it('keeps the selected branch when the runner rejects a request and explains why', () => {
     const base = conversation();
     const userSeq = base.find((event) => event.type === 'user_message')!.id;
-    let state = [
-      ...base,
-      ev('branch_request', { op: 'regenerate', targetSeq: userSeq }),
-      ...reply('added an animation'),
-    ].reduce(foldEvent, blankFold);
+    const regen = ev('branch_request', { op: 'regenerate', targetSeq: userSeq });
+    let state = [...base, regen, applied(regen), ...reply('added an animation')].reduce(
+      foldEvent,
+      blankFold,
+    );
     const switchRequest = ev('branch_request', {
       op: 'switch',
       targetSeq: userSeq,
       variant: 'orig',
     });
     state = foldEvent(state, switchRequest);
-    expect(onScreen(state).at(-1)).toBe('added a video');
+    expect(onScreen(state).at(-1)).toBe('added an animation');
     state = foldEvent(
       state,
       ev(
@@ -202,50 +224,36 @@ describe('branch fold', () => {
     expect(onScreen(state).at(-1)).toBe('added an animation');
     expect(state.chat.at(-1)).toMatchObject({
       kind: 'system',
-      copyKey: 'workbench.system.branchRejected',
+      copyKey: 'workbench.chat.branchMediaPending',
     });
   });
 
-  it('shows an edit the runner could not put in place as a new message, and says so', () => {
+  it('keeps a refused edit out of the conversation and preserves the original active question', () => {
     const base = conversation();
     const userSeq = base.find((event) => event.type === 'user_message')!.id;
+    base.push(ev('user_question', { question: 'Make another page?' }));
     const edit = ev('branch_request', { op: 'edit', targetSeq: userSeq });
-    let state = [
+    const state = [
       ...base,
       edit,
-      ev('user_message', { text: 'add an animation to page 2', delivery: 'queued' }),
-    ].reduce(foldEvent, blankFold);
-    expect(forkOf(state, 'add an animation to page 2')).toBe('2/2');
-
-    state = [
+      ev('user_message', { text: 'Rejected edit', delivery: 'queued' }),
       ev(
-        'session_resumed',
+        'session_end',
         {
-          reason: 'follow_up',
+          status: 'succeeded',
+          note: 'branch requests only',
           branches: [
             { requestSeq: edit.id, op: 'edit', status: 'rejected', reason: 'checkout_failed' },
           ],
         },
         1,
       ),
-      ...reply('added an animation'),
-      ev('session_end', { status: 'succeeded' }, 1),
-    ].reduce(foldEvent, state);
-
-    // The runner delivered it at the end of the branch it stayed on; so does the rail.
-    expect(onScreen(state)).toEqual([
-      '> make a photosynthesis lesson',
-      'outline and three pages',
-      '> add a video to page 2',
-      'added a video',
-      '> add an animation to page 2',
-      'added an animation',
-    ]);
+    ].reduce(foldEvent, blankFold);
+    expect(state.chat.some((node) => node.text === 'Rejected edit')).toBe(false);
+    expect(state.chat.find((node) => node.kind === 'question')?.questionAnswered).toBeFalsy();
+    expect(onScreen(state).at(-1)).toBe('added a video');
     expect(forkOf(state, 'add a video to page 2')).toBeNull();
-    const notice = projectBranchChat(state.chat, state.branch!).chat.find(
-      (node) => node.kind === 'system',
-    );
-    expect(notice).toMatchObject({ copyKey: 'workbench.system.branchEditSentAsNew' });
+    expect(state.chat.at(-1)).toMatchObject({ copyKey: 'workbench.system.branchNotApplied' });
   });
 
   it('says when a version could not be restored, and when putting it back failed too', () => {
@@ -275,14 +283,62 @@ describe('branch fold', () => {
     });
   });
 
+  it('shows the selected course and keeps other-tab follow-ups on the branch that was applied', () => {
+    const events = conversation();
+    const userSeq = events.find((e) => e.type === 'user_message')!.id;
+    events.push(
+      ev('checkpoint', {
+        kind: 'outline',
+        outline: [{ order: 1, title: 'List' }],
+        courseTitle: 'List',
+      }),
+    );
+    const regen = ev('branch_request', { op: 'regenerate', targetSeq: userSeq });
+    events.push(
+      regen,
+      ev(
+        'session_resumed',
+        {
+          reason: 'follow_up',
+          branches: [{ requestSeq: regen.id, op: 'regenerate', status: 'applied' }],
+        },
+        1,
+      ),
+      ...reply('added a quiz'),
+      ev('checkpoint', {
+        kind: 'outline',
+        outline: [{ order: 1, title: 'Quiz' }],
+        courseTitle: 'Quiz',
+      }),
+      ev('session_end', { status: 'succeeded' }, 1),
+    );
+    const pick = ev('branch_request', { op: 'switch', targetSeq: userSeq, variant: 'orig' });
+    events.push(
+      pick,
+      ev('user_message', { text: 'continue', delivery: 'queued' }),
+      ev(
+        'session_resumed',
+        {
+          reason: 'follow_up',
+          branches: [{ requestSeq: pick.id, op: 'switch', status: 'applied' }],
+        },
+        1,
+      ),
+    );
+    const selected = events.reduce(foldEvent, blankFold);
+    expect(selected.chat.filter((n) => n.kind === 'assistant').map((n) => n.text)).toEqual([
+      'outline and three pages',
+      'added a video',
+    ]);
+    expect(onScreen(selected).at(-1)).toBe('> continue');
+    expect(selected.courseTitle).toBe('List');
+  });
+
   it('folds a replayed log to the same branches', () => {
     const base = conversation();
     const userSeq = base.find((event) => event.type === 'user_message')!.id;
-    const events = [
-      ...base,
-      ev('branch_request', { op: 'regenerate', targetSeq: userSeq }),
-      ...reply('added an animation'),
-    ];
+    const regen = ev('branch_request', { op: 'regenerate', targetSeq: userSeq });
+    const events = [...base, regen, applied(regen), ...reply('added an animation')];
     const live = events.reduce(foldEvent, blankFold);
     const replayed = events.reduce(foldEvent, blankFold);
     expect(replayed.branch).toEqual(live.branch);
