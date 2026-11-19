@@ -22,10 +22,12 @@
  * question card: it is a hand-over, so it gets its own line and the host's send
  * path (`onAnswer`).
  */
-import { useMemo } from 'react';
+import { useMemo, useState, type ReactNode } from 'react';
 import { CircleSlash2 } from 'lucide-react';
 import { courseCardExclusions } from '@/lib/workbench/course-link';
 import type { ChatNode, PlannedPage } from '@/lib/workbench/session-store';
+import type { BranchFork, BranchSegment } from '@/lib/workbench/branch-fold';
+import { ReplyTurnControls, UserBubbleEditor, UserTurnControls } from './branch-controls';
 import { defaultWorkbenchTranslator, type WorkbenchTranslator } from '@/lib/i18n/workbench';
 import { wbStyles as styles } from './chat-styles';
 import { ActionCluster } from './action-cluster';
@@ -248,6 +250,26 @@ function ChatNodeView({
   }
 }
 
+/**
+ * Edit-and-resend on the timeline (#1317 prototype). Absent, the timeline is
+ * exactly the linear one it always was.
+ */
+export interface TimelineBranch {
+  segments: Readonly<Record<string, BranchSegment>>;
+  forks: ReadonlyMap<string, BranchFork>;
+  /** A branch request is on its way: every control waits for it. */
+  disabled: boolean;
+  /** Send `text` as a new version of user message `userSeq`; resolves whether it was accepted. */
+  onEdit: (userSeq: number, text: string, node: ChatNode) => Promise<boolean>;
+  onRegenerate: (userSeq: number) => void;
+  onSwitchUser: (userSeq: number) => void;
+  onSwitchReply: (userSeq: number, variant: number | 'orig') => void;
+}
+
+function segmentOfRow(row: ChatRow): string | undefined {
+  return (row.node ?? row.group?.[0])?.segment;
+}
+
 export function ChatTimeline({
   chat,
   plan,
@@ -257,6 +279,7 @@ export function ChatTimeline({
   takenOverQuestionKey,
   questionPointer = 'below',
   turnActive = false,
+  branch,
   t = defaultWorkbenchTranslator,
 }: {
   chat: ChatNode[];
@@ -285,42 +308,123 @@ export function ChatTimeline({
   questionPointer?: QuestionPointer;
   /** The agent is still working, between events or not. */
   turnActive?: boolean;
+  /** Edit-and-resend controls (#1317 prototype). */
+  branch?: TimelineBranch;
   t?: WorkbenchTranslator;
 }) {
   const rows = rowsForRender(chat);
   const exclusions = useMemo(() => courseCardExclusions(chat), [chat]);
-  return (
-    <div className={styles.timeline.root}>
-      {rows.map((row, index) =>
-        row.group || isActionBar(row.node!) ? (
-          <ActionCluster
-            key={row.key}
-            nodes={row.group ?? [row.node!]}
-            plan={plan}
-            ongoing={turnActive && index === rows.length - 1}
-            t={t}
-          />
-        ) : (
-          <ChatNodeView
-            key={row.key}
-            node={row.node!}
-            plan={plan}
-            repeat={row.repeat}
-            excludeCourseCards={exclusions.get(row.node!.key)}
-            t={t}
-            onAnswer={onAnswer}
-            collapsedQuestion={
-              Boolean(takenOverQuestionKey) && row.node!.key === takenOverQuestionKey
-            }
-            questionPointer={questionPointer}
-            onRevive={
-              row.node!.key === dismissedQuestionKey && onReviveQuestion
-                ? onReviveQuestion
-                : undefined
-            }
-          />
-        ),
-      )}
-    </div>
-  );
+  const [editingKey, setEditingKey] = useState<string | null>(null);
+  const lastSegment = rows.length > 0 ? segmentOfRow(rows[rows.length - 1]!) : undefined;
+
+  /** The bubble, or its editor, and the controls under it. */
+  const userRow = (row: ChatRow, view: ReactNode): ReactNode => {
+    const node = row.node!;
+    const segment = branch && node.segment ? branch.segments[node.segment] : undefined;
+    if (!branch || !segment || segment.kind !== 'user' || segment.userSeq === undefined)
+      return view;
+    const userSeq = segment.userSeq;
+    const fork = branch.forks.get(segment.id);
+    if (editingKey === node.key) {
+      return (
+        <UserBubbleEditor
+          key={row.key}
+          initialText={node.text}
+          hasAttachments={Boolean(node.materials?.length)}
+          onCancel={() => setEditingKey(null)}
+          onSubmit={async (text) => {
+            const accepted = await branch.onEdit(userSeq, text, node);
+            if (accepted) setEditingKey(null);
+            return accepted;
+          }}
+          t={t}
+        />
+      );
+    }
+    return (
+      <div key={row.key} className="flex flex-col gap-0.5">
+        {view}
+        <UserTurnControls
+          fork={fork}
+          // The opening prompt starts the session; the prototype edits follow-ups only.
+          // A run still writing is no reason to hide it: the request stops the run first.
+          editable={userSeq > 0}
+          disabled={branch.disabled}
+          onEdit={() => setEditingKey(node.key)}
+          onSelect={(index) => {
+            const target = fork?.siblings[index]?.userSeq;
+            if (target !== undefined) branch.onSwitchUser(target);
+          }}
+          t={t}
+        />
+      </div>
+    );
+  };
+
+  /** The controls closing one reply: switch between its versions, regenerate it. */
+  const replyControls = (segmentId: string): ReactNode => {
+    if (!branch) return null;
+    const segment = branch.segments[segmentId];
+    if (segment?.kind !== 'reply' || !segment.parent) return null;
+    const userSeq = branch.segments[segment.parent]?.userSeq;
+    if (userSeq === undefined) return null;
+    const live = turnActive && segmentId === lastSegment;
+    if (live) return null;
+    const fork = branch.forks.get(segmentId);
+    return (
+      <ReplyTurnControls
+        key={`branch-${segmentId}`}
+        fork={fork}
+        canRegenerate
+        disabled={branch.disabled}
+        onRegenerate={() => branch.onRegenerate(userSeq)}
+        onSelect={(index) => {
+          const variant = fork?.siblings[index]?.variant;
+          if (variant !== undefined) branch.onSwitchReply(userSeq, variant);
+        }}
+        t={t}
+      />
+    );
+  };
+
+  const rendered: ReactNode[] = [];
+  rows.forEach((row, index) => {
+    rendered.push(renderRow(row, index));
+    const segmentId = segmentOfRow(row);
+    const nextSegment = index + 1 < rows.length ? segmentOfRow(rows[index + 1]!) : undefined;
+    if (segmentId && segmentId !== nextSegment) rendered.push(replyControls(segmentId));
+  });
+
+  function renderRow(row: ChatRow, index: number): ReactNode {
+    if (row.group || isActionBar(row.node!)) {
+      return (
+        <ActionCluster
+          key={row.key}
+          nodes={row.group ?? [row.node!]}
+          plan={plan}
+          ongoing={turnActive && index === rows.length - 1}
+          t={t}
+        />
+      );
+    }
+    const view = (
+      <ChatNodeView
+        key={row.key}
+        node={row.node!}
+        plan={plan}
+        repeat={row.repeat}
+        excludeCourseCards={exclusions.get(row.node!.key)}
+        t={t}
+        onAnswer={onAnswer}
+        collapsedQuestion={Boolean(takenOverQuestionKey) && row.node!.key === takenOverQuestionKey}
+        questionPointer={questionPointer}
+        onRevive={
+          row.node!.key === dismissedQuestionKey && onReviveQuestion ? onReviveQuestion : undefined
+        }
+      />
+    );
+    return row.node!.kind === 'user' ? userRow(row, view) : view;
+  }
+
+  return <div className={styles.timeline.root}>{rendered}</div>;
 }

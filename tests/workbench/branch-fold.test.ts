@@ -114,8 +114,14 @@ describe('branch fold', () => {
     ]);
     expect(forkOf(state, 'added an animation')).toBe('2/2');
 
-    state = foldEvent(state, ev('branch_request', { op: 'switch', targetSeq: userSeq, variant: 'orig' }));
-    state = foldEvent(state, ev('session_end', { status: 'succeeded', note: 'branch switched' }, 1));
+    state = foldEvent(
+      state,
+      ev('branch_request', { op: 'switch', targetSeq: userSeq, variant: 'orig' }),
+    );
+    state = foldEvent(
+      state,
+      ev('session_end', { status: 'succeeded', note: 'branch requests only' }, 1),
+    );
     expect(onScreen(state).at(-1)).toBe('added a video');
     expect(forkOf(state, 'added a video')).toBe('1/2');
 
@@ -159,8 +165,114 @@ describe('branch fold', () => {
     const view = projectBranchChat(state.chat, state.branch!);
     const stopped = view.chat.find((node) => node.text === 'starting')!;
     expect(state.branch!.segments[stopped.segment!]?.endStatus).toBe('cancelled');
-    state = foldEvent(state, ev('session_end', { status: 'succeeded', note: 'branch switched' }, 1));
+    state = foldEvent(
+      state,
+      ev('session_end', { status: 'succeeded', note: 'branch requests only' }, 1),
+    );
     expect(state.branch!.segments[stopped.segment!]?.endStatus).toBe('cancelled');
+  });
+
+  it('undoes a request the runner rejected, and says so', () => {
+    const base = conversation();
+    const userSeq = base.find((event) => event.type === 'user_message')!.id;
+    let state = [
+      ...base,
+      ev('branch_request', { op: 'regenerate', targetSeq: userSeq }),
+      ...reply('added an animation'),
+    ].reduce(foldEvent, blankFold);
+    const switchRequest = ev('branch_request', {
+      op: 'switch',
+      targetSeq: userSeq,
+      variant: 'orig',
+    });
+    state = foldEvent(state, switchRequest);
+    expect(onScreen(state).at(-1)).toBe('added a video');
+    state = foldEvent(
+      state,
+      ev(
+        'session_end',
+        {
+          status: 'succeeded',
+          note: 'branch requests only',
+          branches: [{ requestSeq: switchRequest.id, status: 'rejected', reason: 'media_pending' }],
+        },
+        1,
+      ),
+    );
+    expect(onScreen(state).at(-1)).toBe('added an animation');
+    expect(state.chat.at(-1)).toMatchObject({
+      kind: 'system',
+      copyKey: 'workbench.system.branchRejected',
+    });
+  });
+
+  it('shows an edit the runner could not put in place as a new message, and says so', () => {
+    const base = conversation();
+    const userSeq = base.find((event) => event.type === 'user_message')!.id;
+    const edit = ev('branch_request', { op: 'edit', targetSeq: userSeq });
+    let state = [
+      ...base,
+      edit,
+      ev('user_message', { text: 'add an animation to page 2', delivery: 'queued' }),
+    ].reduce(foldEvent, blankFold);
+    expect(forkOf(state, 'add an animation to page 2')).toBe('2/2');
+
+    state = [
+      ev(
+        'session_resumed',
+        {
+          reason: 'follow_up',
+          branches: [
+            { requestSeq: edit.id, op: 'edit', status: 'rejected', reason: 'checkout_failed' },
+          ],
+        },
+        1,
+      ),
+      ...reply('added an animation'),
+      ev('session_end', { status: 'succeeded' }, 1),
+    ].reduce(foldEvent, state);
+
+    // The runner delivered it at the end of the branch it stayed on; so does the rail.
+    expect(onScreen(state)).toEqual([
+      '> make a photosynthesis lesson',
+      'outline and three pages',
+      '> add a video to page 2',
+      'added a video',
+      '> add an animation to page 2',
+      'added an animation',
+    ]);
+    expect(forkOf(state, 'add a video to page 2')).toBeNull();
+    const notice = projectBranchChat(state.chat, state.branch!).chat.find(
+      (node) => node.kind === 'system',
+    );
+    expect(notice).toMatchObject({ copyKey: 'workbench.system.branchEditSentAsNew' });
+  });
+
+  it('says when a version could not be restored, and when putting it back failed too', () => {
+    const base = conversation();
+    const userSeq = base.find((event) => event.type === 'user_message')!.id;
+    const outcomeOf = (extra: Record<string, unknown>) => {
+      seq = base.length;
+      const regenerate = ev('branch_request', { op: 'regenerate', targetSeq: userSeq });
+      const end = ev(
+        'session_end',
+        {
+          status: 'succeeded',
+          note: 'branch requests only',
+          branches: [{ requestSeq: regenerate.id, op: 'regenerate', status: 'rejected', ...extra }],
+        },
+        1,
+      );
+      const state = [...base, regenerate, end].reduce(foldEvent, blankFold);
+      expect(onScreen(state).at(-1)).toBe('added a video');
+      return state.chat.at(-1);
+    };
+    expect(outcomeOf({ reason: 'checkout_failed' })).toMatchObject({
+      copyKey: 'workbench.system.branchNotApplied',
+    });
+    expect(outcomeOf({ reason: 'apply_failed', rollbackFailed: true })).toMatchObject({
+      copyKey: 'workbench.system.branchRollbackFailed',
+    });
   });
 
   it('folds a replayed log to the same branches', () => {

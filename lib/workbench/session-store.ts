@@ -22,10 +22,12 @@
  *    `lastEventId` instead of replaying the whole run.
  */
 import {
+  applyBranchOutcomes,
   applyBranchRequest,
   assignSegments,
   initialBranchState,
   markRunEnd,
+  type BranchRejectionNotice,
   type BranchState,
 } from './branch-fold';
 import { create } from 'zustand';
@@ -1018,14 +1020,43 @@ export function foldEvent(state: WorkbenchFold, event: WorkbenchEvent): Workbenc
  * `branch_request` moves the branch first, then the nodes the event added are
  * tagged with their segment, then a run's end is recorded on its reply.
  */
+const BRANCH_REJECTION_COPY = {
+  rollback_failed: 'workbench.system.branchRollbackFailed',
+  edit: 'workbench.system.branchEditSentAsNew',
+  not_applied: 'workbench.system.branchNotApplied',
+  rejected: 'workbench.system.branchRejected',
+} as const satisfies Record<BranchRejectionNotice, string>;
+
 function trackBranches(
   state: WorkbenchFold,
   next: WorkbenchFold,
   event: WorkbenchEvent,
 ): WorkbenchFold {
   let branch = state.branch ?? initialBranchState();
+  let chat = next.chat;
   if (event.type === 'branch_request') branch = applyBranchRequest(branch, event.data, event.id);
-  const assigned = assignSegments(state.chat, next.chat, branch);
+  if (
+    event.type === 'session_start' ||
+    event.type === 'session_resumed' ||
+    event.type === 'session_end'
+  ) {
+    const outcomes = applyBranchOutcomes(branch, event.data);
+    branch = outcomes.state;
+    if (outcomes.rejected > 0) {
+      const copyKey = BRANCH_REJECTION_COPY[outcomes.notice ?? 'rejected'];
+      chat = [
+        ...chat,
+        {
+          key: `e${event.id}-branch`,
+          kind: 'system',
+          tone: 'error',
+          text: defaultWorkbenchTranslator(copyKey),
+          copyKey,
+        },
+      ];
+    }
+  }
+  const assigned = assignSegments(state.chat, chat, branch);
   branch = assigned.branch;
   if (event.type === 'session_end') branch = markRunEnd(branch, event.data);
   if (assigned.chat === next.chat && branch === next.branch) return next;
@@ -2179,6 +2210,43 @@ export async function renameWorkbenchSession(
     );
   }
   return body.title ?? null;
+}
+
+/** A branch request (#1317 prototype); see `app/api/agent/sessions/[id]/branch`. */
+export type WorkbenchBranchRequest =
+  | { op: 'regenerate'; targetSeq: number }
+  | { op: 'switch'; targetSeq: number; variant?: number | 'orig' }
+  | {
+      op: 'edit';
+      targetSeq: number;
+      text: string;
+      elementRefs?: readonly ElementRef[];
+      courseRefs?: readonly CourseRef[];
+    };
+
+export async function branchWorkbenchSession(
+  sessionId: string,
+  request: WorkbenchBranchRequest,
+): Promise<void> {
+  const res = await fetch(`/api/agent/sessions/${encodeURIComponent(sessionId)}/branch`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    // An edited message carries the interface language like any message sent.
+    body: JSON.stringify({ ...request, ...(request.op === 'edit' ? interfaceLocale() : {}) }),
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as {
+      error?: string;
+      message?: string;
+      code?: string;
+      errorCode?: string;
+    };
+    throw new WorkbenchApiError(
+      body.message ?? body.error ?? `POST branch -> ${res.status}`,
+      res.status,
+      body.code ?? body.errorCode,
+    );
+  }
 }
 
 export async function cancelWorkbenchSession(sessionId: string): Promise<void> {

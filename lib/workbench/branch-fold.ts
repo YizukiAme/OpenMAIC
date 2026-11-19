@@ -44,6 +44,12 @@ export interface BranchState {
   pending: PendingBranch | null;
   /** Bumped by every request that changes the branch on screen. */
   epoch: number;
+  /**
+   * The branch as it was before the latest request, so a request the runner
+   * rejects can be undone. The runner reports outcomes on the next lifecycle
+   * frame, before anything else lands on the branch.
+   */
+  beforeRequest?: { requestSeq: number; state: Omit<BranchState, 'beforeRequest'> } | null;
 }
 
 export function initialBranchState(): BranchState {
@@ -94,7 +100,75 @@ export function activePath(state: BranchState): BranchSegment[] {
 }
 
 /** Fold one `branch_request` event (`eventId` is its sequence). */
-export function applyBranchRequest(state: BranchState, data: unknown, eventId: number): BranchState {
+export function applyBranchRequest(
+  state: BranchState,
+  data: unknown,
+  eventId: number,
+): BranchState {
+  const next = moveForRequest(state, data, eventId);
+  if (next === state) return state;
+  const { beforeRequest: _previous, ...previous } = state;
+  return { ...next, beforeRequest: { requestSeq: eventId, state: previous } };
+}
+
+/**
+ * What the notice for rejected requests says, most important first:
+ * `rollback_failed` -- undoing a failed request failed too, so a course may be
+ * left at another version; `edit` -- an edited message the runner could not
+ * put in place is delivered as a new message at the end; `not_applied` -- a
+ * course could not be restored, so nothing changed; `rejected` -- anything
+ * else the runner turned down.
+ */
+export type BranchRejectionNotice = 'rollback_failed' | 'edit' | 'not_applied' | 'rejected';
+
+const NOTICE_RANK: Record<BranchRejectionNotice, number> = {
+  rollback_failed: 3,
+  edit: 2,
+  not_applied: 1,
+  rejected: 0,
+};
+
+/**
+ * Undo requests the runner rejected (`branches` on a lifecycle frame).
+ * Returns how many were undone and the one notice to show for them.
+ */
+export function applyBranchOutcomes(
+  state: BranchState,
+  data: unknown,
+): { state: BranchState; rejected: number; notice?: BranchRejectionNotice } {
+  const outcomes = (data as { branches?: unknown } | null)?.branches;
+  if (!Array.isArray(outcomes)) return { state, rejected: 0 };
+  let next = state;
+  let rejected = 0;
+  let notice: BranchRejectionNotice | undefined;
+  for (const outcome of outcomes) {
+    const { requestSeq, status, op, reason, rollbackFailed } = (outcome ?? {}) as {
+      requestSeq?: unknown;
+      status?: unknown;
+      op?: unknown;
+      reason?: unknown;
+      rollbackFailed?: unknown;
+    };
+    if (status !== 'rejected') continue;
+    rejected += 1;
+    const said: BranchRejectionNotice =
+      rollbackFailed === true
+        ? 'rollback_failed'
+        : op === 'edit'
+          ? 'edit'
+          : reason === 'checkout_failed' || reason === 'apply_failed'
+            ? 'not_applied'
+            : 'rejected';
+    if (!notice || NOTICE_RANK[said] > NOTICE_RANK[notice]) notice = said;
+    const before = next.beforeRequest;
+    if (before && before.requestSeq === requestSeq) {
+      next = { ...before.state, epoch: next.epoch + 1, beforeRequest: null };
+    }
+  }
+  return { state: next, rejected, ...(notice ? { notice } : {}) };
+}
+
+function moveForRequest(state: BranchState, data: unknown, eventId: number): BranchState {
   const request = (data ?? {}) as { op?: unknown; targetSeq?: unknown; variant?: unknown };
   if (typeof request.targetSeq !== 'number') return state;
   const user = userSegmentOf(state, request.targetSeq);
@@ -168,6 +242,11 @@ export function userSeqOfNodeKey(key: string): number | undefined {
  * Tag the nodes a fold step added with their segment, starting segments as
  * needed: a user node starts a user segment; anything else starts a reply
  * segment unless one is already open.
+ *
+ * A node whose segment a rejected request created (and undoing removed) is
+ * tagged again where it now belongs: an edited message the runner could not
+ * put in place is delivered at the end of the branch the conversation stayed
+ * on, so that is where it shows.
  */
 export function assignSegments(
   previous: readonly ChatNode[],
@@ -179,14 +258,14 @@ export function assignSegments(
   let byKey: Map<string, string | undefined> | undefined;
   let changed = false;
   const chat = next.map((node, index) => {
-    if (node.segment) return node;
+    if (node.segment && branch.segments[node.segment]) return node;
     const sameSlot = previous[index];
-    let segment =
-      sameSlot?.key === node.key ? sameSlot.segment : undefined;
+    let segment = sameSlot?.key === node.key ? sameSlot.segment : undefined;
     if (!segment) {
       byKey ??= new Map(previous.map((old) => [old.key, old.segment]));
       segment = byKey.get(node.key);
     }
+    if (segment && !branch.segments[segment]) segment = undefined;
     if (!segment) {
       if (node.kind === 'user') {
         branch = startSegment(branch, 'user', { userSeq: userSeqOfNodeKey(node.key) });
@@ -206,10 +285,10 @@ export function assignSegments(
   return { chat: changed ? chat : next, branch };
 }
 
-/** Record how a run ended on the reply it wrote into. A switch-only claim wrote nothing. */
+/** Record how a run ended on the reply it wrote into. A claim made only for branch requests wrote nothing. */
 export function markRunEnd(state: BranchState, data: unknown): BranchState {
   const end = (data ?? {}) as { status?: unknown; note?: unknown };
-  if (end.note === 'branch switched') return state;
+  if (end.note === 'branch requests only') return state;
   const current = state.segments[state.current];
   if (current?.kind !== 'reply' || typeof end.status !== 'string') return state;
   return update(state, current.id, (segment) => ({

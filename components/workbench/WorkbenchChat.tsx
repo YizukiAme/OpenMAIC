@@ -62,15 +62,20 @@ import {
   composerTransferHasImages,
 } from '@/lib/workbench/composer-image-transfer';
 import {
+  branchWorkbenchSession,
   cancelWorkbenchSession,
   postWorkbenchMessage,
   recoverTerminalCancelStatus,
   useWorkbenchStore,
+  WorkbenchApiError,
   type ChatNode,
   type PlannedPage,
   type SessionStatus,
+  type WorkbenchBranchRequest,
   type WorkbenchMaterial,
 } from '@/lib/workbench/session-store';
+import { initialBranchState, projectBranchChat } from '@/lib/workbench/branch-fold';
+import { useCourseTimeline } from '@/lib/edit/course-timeline';
 import {
   AtSignButton,
   AttachButton,
@@ -93,6 +98,7 @@ import {
 import { resolveComposerMenu } from '@/lib/workbench/composer-menus';
 import {
   isComposerLive,
+  isRunLive,
   shouldPromptForRefInstruction,
   shouldDropPendingSend,
   shouldDropPendingStop,
@@ -105,7 +111,7 @@ import {
 import { useDoubleEscapeStop } from './chat/composer-escape';
 import { useWorkbenchAutoscroll } from './chat/autoscroll';
 import { chatColumn, composerLayout, wbStyles as styles } from './chat/chat-styles';
-import { ChatTimeline } from './chat/chat-timeline';
+import { ChatTimeline, type TimelineBranch } from './chat/chat-timeline';
 import { queuedOpeningMessage } from '@/lib/workbench/queued-session';
 import { type SeedCourseAsk, seedIsTitleOnlyChange } from '@/lib/workbench/draft-course-title';
 import { pendingQuestion } from './chat/question-card-state';
@@ -126,6 +132,29 @@ const NO_ELEMENT_REFS: ElementRef[] = [];
 const NO_COURSE_REFS: CourseRef[] = [];
 /** How long another conversation's transcript may stay up while the next one loads. */
 const TRANSCRIPT_RETENTION_GRACE_MS = 1_000;
+
+/** How long a branch request waits for the run it stopped to end (#1317 prototype). */
+const BRANCH_STOP_TIMEOUT_MS = 30_000;
+
+/** Resolve true once the attached session's run is no longer live, false on timeout. */
+function waitForRunEnd(timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let unsubscribe: () => void = () => {};
+    const finish = (ended: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      unsubscribe();
+      resolve(ended);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    unsubscribe = useWorkbenchStore.subscribe((state) => {
+      if (!isRunLive(state.status)) finish(true);
+    });
+    if (!isRunLive(useWorkbenchStore.getState().status)) finish(true);
+  });
+}
 
 export function WorkbenchChat({
   hosted = false,
@@ -190,7 +219,15 @@ export function WorkbenchChat({
    */
   const ownerAttached = conversation === undefined || conversation === composerOwnerId;
   const canSend = ownerAttached && (sessionId !== null || draftConversation !== null);
-  const chat = useWorkbenchStore((s) => s.chat);
+  // The fold keeps every branch's nodes; the rail shows the branch on screen
+  // (#1317 prototype). A conversation that never branched projects to itself.
+  const foldedChat = useWorkbenchStore((s) => s.chat);
+  const branchState = useWorkbenchStore((s) => s.branch);
+  const branchView = useMemo(
+    () => projectBranchChat(foldedChat, branchState ?? initialBranchState()),
+    [foldedChat, branchState],
+  );
+  const chat = branchView.chat;
   const replaying = useWorkbenchStore((s) => s.replaying);
   const status = useWorkbenchStore((s) => s.status);
   const plan = useWorkbenchStore((s) => s.plan);
@@ -1030,6 +1067,82 @@ export function WorkbenchChat({
     }
   }, [busy, ownerAttached, pendingStop, sessionId, t]);
 
+  // ── Edit-and-resend (#1317 prototype) ──────────────────────────────────
+  //
+  // Every control on the timeline goes through here. A run that is still
+  // writing is stopped first (the cancel route): its half-built reply and course
+  // are kept as a version of their own, and the request is sent once the run
+  // has ended. The rail stays usable meanwhile; a stop that does not land in
+  // time says so instead of waiting forever.
+  const [branchPending, setBranchPending] = useState(false);
+  const branchInFlight = useRef(false);
+  const requestBranch = useCallback(
+    async (request: WorkbenchBranchRequest): Promise<boolean> => {
+      if (!sessionId || !ownerAttached || branchInFlight.current) return false;
+      const target = sessionId;
+      branchInFlight.current = true;
+      setBranchPending(true);
+      try {
+        if (isRunLive(useWorkbenchStore.getState().status)) {
+          toast.info(t('workbench.chat.branchStopping'));
+          try {
+            await cancelWorkbenchSession(target);
+          } catch (err) {
+            if (!recoverTerminalCancelStatus(target, err)) throw err;
+          }
+          if (!(await waitForRunEnd(BRANCH_STOP_TIMEOUT_MS))) {
+            toast.error(t('workbench.chat.branchStopTimeout'));
+            return false;
+          }
+        }
+        await branchWorkbenchSession(target, request);
+        return true;
+      } catch (err) {
+        const code = err instanceof WorkbenchApiError ? err.errorCode : undefined;
+        if (code === 'MEDIA_PENDING') toast.warning(t('workbench.chat.branchMediaPending'));
+        else if (code === 'SESSION_BUSY') toast.error(t('workbench.chat.branchStopTimeout'));
+        else toast.error(t('workbench.chat.branchFailed'));
+        return false;
+      } finally {
+        branchInFlight.current = false;
+        setBranchPending(false);
+      }
+    },
+    [ownerAttached, sessionId, t],
+  );
+  const timelineBranch = useMemo<TimelineBranch>(
+    () => ({
+      segments: branchView.segments,
+      forks: branchView.forks,
+      disabled: branchPending || !ownerAttached,
+      onEdit: (userSeq, text, node) =>
+        requestBranch({
+          op: 'edit',
+          targetSeq: userSeq,
+          text,
+          ...(node.elementRefs?.length ? { elementRefs: node.elementRefs } : {}),
+          ...(node.courseRefs?.length ? { courseRefs: node.courseRefs } : {}),
+        }),
+      onRegenerate: (userSeq) => void requestBranch({ op: 'regenerate', targetSeq: userSeq }),
+      onSwitchUser: (userSeq) => void requestBranch({ op: 'switch', targetSeq: userSeq }),
+      onSwitchReply: (userSeq, variant) =>
+        void requestBranch({ op: 'switch', targetSeq: userSeq, variant }),
+    }),
+    [branchView, branchPending, ownerAttached, requestBranch],
+  );
+  // A branch change writes another version of the course over the live one, so
+  // an undo step recorded against the old content would land on the wrong one.
+  // Replaying a log is not a change: it only catches the counter up.
+  const branchEpoch = branchState?.epoch ?? 0;
+  const seenBranchEpoch = useRef(branchEpoch);
+  useEffect(() => {
+    if (branchEpoch === seenBranchEpoch.current) return;
+    seenBranchEpoch.current = branchEpoch;
+    if (replaying) return;
+    const timeline = useCourseTimeline.getState();
+    for (const stageId of Object.keys(timeline.lines)) timeline.clearCourse(stageId);
+  }, [branchEpoch, replaying]);
+
   useDoubleEscapeStop({
     generating: live && !busy && !pendingStop && !!sessionId && ownerAttached && !covered,
     onStop: () => {
@@ -1329,6 +1442,7 @@ export function WorkbenchChat({
                     chat={displayedChat}
                     plan={displayedPlan}
                     turnActive={live}
+                    branch={retainedTranscript ? undefined : timelineBranch}
                     onAnswer={answerQuestion}
                     dismissedQuestionKey={dismissedQuestionKey}
                     onReviveQuestion={(freeText) => {
