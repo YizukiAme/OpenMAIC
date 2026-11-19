@@ -121,6 +121,21 @@ import {
   createPersonalHistorySource,
   PERSONAL_HISTORY_TOOL_NAMES,
 } from './personal-history-tools';
+import type { Queryable } from '@openmaic/storage/document/pg';
+import { getServerPersistenceProvider } from '@/lib/persistence/server-provider';
+import { listPendingMediaTasks } from './pending-media';
+import {
+  ensureCourseVersionStore,
+  type CourseDocumentWriter,
+} from '@/lib/server/course-versions/store';
+import {
+  applyBranchRequests,
+  readPendingBranchRequests,
+  recordCourseVersions,
+  type ApplyBranchResult,
+  type CourseVersionDeps,
+} from '@/lib/server/course-versions/branching';
+import type { CourseVersionsEntryData } from '@/lib/server/course-versions/tree';
 
 const log = createLogger('AgentRunner');
 const PROCESS_WORKER_ID = `${randomUUID().slice(0, 8)}:${process.pid}`;
@@ -1166,11 +1181,15 @@ async function executeSession(
   };
 
   let entrySession: Session | undefined;
-  const loadEntryHistory = async (): Promise<SessionEntryHistory> => {
+  const openEntrySession = async (): Promise<Session> => {
     entrySession ??= new Session(
       await AgentSessionEntryStorage.open({ sessionId: id, workerId: WORKER_ID, attempt }),
     );
-    return loadSessionEntryHistory(entrySession, {
+    return entrySession;
+  };
+  const loadEntryHistory = async (): Promise<SessionEntryHistory> => {
+    await openEntrySession();
+    return loadSessionEntryHistory(entrySession!, {
       sessionId: id,
       priorRuns: () => readPriorRunRecord(store, id),
     });
@@ -1427,7 +1446,87 @@ async function executeSession(
   // disposed on every exit path.
   let compactionRuntime: AgentCompactionRuntime | undefined;
 
+  // Course versions (#1317): what the run reads and writes to keep each branch
+  // of the conversation on its own course. Built lazily: a session that never
+  // branches pays one hash per run boundary and nothing else.
+  let courseVersionDeps: CourseVersionDeps | undefined;
+  const getCourseVersionDeps = async (): Promise<CourseVersionDeps> => {
+    if (courseVersionDeps) return courseVersionDeps;
+    const provider = await getServerPersistenceProvider(process.env.DATABASE_URL ?? '');
+    await ensureCourseVersionStore(provider.pool);
+    const session = await openEntrySession();
+    courseVersionDeps = {
+      sessionId: id,
+      ownerId: meta.ownerId,
+      defaultStageId: meta.stageId,
+      session,
+      writeEntry: (write) => writeRequiredSessionEntry(write, markLeaseLost),
+      documents: (await getBackgroundDocumentStore(meta.ownerId, async (transaction) => {
+        await store.assertActiveLease(id, WORKER_ID, attempt, transaction);
+      })) as unknown as CourseDocumentWriter,
+      db: {
+        queryable: provider.pool as unknown as Queryable,
+        withTransaction: provider.withTransaction,
+      },
+    };
+    return courseVersionDeps;
+  };
+  // Courses this run wrote, from the tools' checkpoint receipts.
+  const touchedStageIds = new Set<string>();
+  const onStageCheckpoint = (info: unknown): void => {
+    const stageId = (info as { stageId?: unknown } | null)?.stageId;
+    if (typeof stageId === 'string' && stageId) touchedStageIds.add(stageId);
+    emit(LIFECYCLE.checkpoint, info);
+  };
+  // Record the courses at a run boundary. Best effort: a version that cannot
+  // be taken leaves the branch on its previous one, and the run goes on.
+  const recordRunBoundary = async (
+    phase: 'before_run' | 'after_run',
+    status?: string,
+  ): Promise<CourseVersionsEntryData['versions']> => {
+    if (leaseLost || id.startsWith('pbl-role-')) return [];
+    try {
+      return await recordCourseVersions(await getCourseVersionDeps(), {
+        phase,
+        ...(status ? { status } : {}),
+        extraStageIds: touchedStageIds,
+      });
+    } catch (error) {
+      log.warn(`session ${id}: course versions (${phase}) not recorded`, error);
+      return [];
+    }
+  };
+
   try {
+    // Branch requests (#1317) move the conversation before the run is planned,
+    // so planning sees the branch the user asked for.
+    let branching: ApplyBranchResult = { outcomes: [], regenerated: false };
+    if (!id.startsWith('pbl-role-')) {
+      // Reading is best effort: when it fails the requests stay pending and
+      // the next claim applies them; the run itself goes on as before.
+      const pendingBranches = await getServerPersistenceProvider(process.env.DATABASE_URL ?? '')
+        .then((provider) => readPendingBranchRequests(provider.pool as unknown as Queryable, id))
+        .catch((error: unknown) => {
+          log.warn(`session ${id}: branch requests not read`, error);
+          return [];
+        });
+      if (pendingBranches.length > 0) {
+        branching = await applyBranchRequests(
+          {
+            ...(await getCourseVersionDeps()),
+            hasPendingMedia: () =>
+              listPendingMediaTasks().some(
+                (task) => task.sessionId === id && task.status === 'generating',
+              ),
+          },
+          pendingBranches,
+        );
+        await flushAll();
+        if (leaseLost) throw new AgentSessionLeaseLostError(id, WORKER_ID, attempt);
+      }
+    }
+    const branchReceipt = branching.outcomes.length > 0 ? { branches: branching.outcomes } : {};
+
     const recovery = await loadEntryHistory();
     const historyMessages = recovery.messages;
     const plan = planResume(historyMessages);
@@ -1523,6 +1622,28 @@ async function executeSession(
     );
     const idleAttach = meta.existingCourse;
 
+    // A claim made for branch requests has a run to make only when a
+    // regenerate moved onto a message to answer again, or a message is waiting
+    // (an edit's). Otherwise it settles here, even when the branch it ends on
+    // stopped mid-reply: an interrupted branch resumes when the user sends a
+    // message on it, never because they looked at it or a request on it was
+    // turned down.
+    if (branching.outcomes.length > 0 && !branching.regenerated && pending.length === 0) {
+      emit(LIFECYCLE.sessionEnd, {
+        status: 'succeeded',
+        note: 'branch requests only',
+        ...branchReceipt,
+      });
+      await flushAll();
+      const settled = await store.finishSession(id, WORKER_ID, {
+        status: 'succeeded',
+        resetAttempt: true,
+        expectedAttempt: attempt,
+      });
+      if (settled) await requeueIfUndelivered('branch requests');
+      return;
+    }
+
     if (
       ((plan.kind === 'already-complete' && !teaching?.needsTurnReceipt()) ||
         teaching?.isTurnComplete()) &&
@@ -1531,6 +1652,7 @@ async function executeSession(
       emit(LIFECYCLE.sessionEnd, {
         status: 'succeeded',
         note: 'entry history already terminal',
+        ...branchReceipt,
       });
       await flushAll();
       const settled = await store.finishSession(id, WORKER_ID, {
@@ -1559,6 +1681,7 @@ async function executeSession(
         // the same receipt any `user_message` does.
         ...(pending[0]?.elementRefs?.length ? { elementRefs: pending[0].elementRefs } : {}),
         ...(pending[0]?.courseRefs?.length ? { courseRefs: pending[0].courseRefs } : {}),
+        ...branchReceipt,
       });
     } else {
       emit(LIFECYCLE.sessionResumed, {
@@ -1568,6 +1691,7 @@ async function executeSession(
         reason: plan.kind === 'start' || meta.claimReason === 'queued' ? 'follow_up' : 'crash',
         transcriptMessages: modelMessages.length,
         repairedToolCalls: repairedToolCallIds,
+        ...branchReceipt,
       });
     }
 
@@ -1792,7 +1916,7 @@ async function executeSession(
             videoConnection: capabilities.connections.video,
             capabilities,
             stageAccess,
-            onCheckpoint: (info) => emit(LIFECYCLE.checkpoint, info),
+            onCheckpoint: onStageCheckpoint,
             sessionId: id,
             ownerId: meta.ownerId,
             abortSignal: abort.signal,
@@ -1805,7 +1929,7 @@ async function executeSession(
             stageAccess,
             onStageLink: (course) => emit(LIFECYCLE.stageLink, course),
             onLibraryChanged: (change) => emit(LIFECYCLE.libraryChanged, change),
-            onCheckpoint: (info) => emit(LIFECYCLE.checkpoint, info),
+            onCheckpoint: onStageCheckpoint,
             courseGenerations,
           });
           // Scene preview is registered beside the course toolset with its own
@@ -1865,7 +1989,7 @@ async function executeSession(
           const rosterTools = withOwnerStageAuthorization(
             buildRosterTools({
               store: ownerScopedStore,
-              onCheckpoint: (info) => emit(LIFECYCLE.checkpoint, info),
+              onCheckpoint: onStageCheckpoint,
               sessionId: id,
               registeredVoices: sessionRegisteredVoices,
               ttsConnection,
@@ -2290,6 +2414,11 @@ async function executeSession(
         if (plannedStart.durableMessageSeq !== undefined) {
           acceptedMessageSeqs.add(plannedStart.durableMessageSeq);
         }
+        // Course versions (#1317): the courses as this message finds them,
+        // hand edits included, recorded on the path right above the user
+        // frame. Editing or regenerating this message later starts from here.
+        await flushAll();
+        await recordRunBoundary('before_run');
         // ── Forced skill loading ─────────────────────────────────────────────
         //
         // A skill the user chose must be LOADED, not merely hinted at, and ONE
@@ -2367,9 +2496,13 @@ async function executeSession(
         // Delivery carries NO user message — the follow-up cursor is the count
         // of `user` messages in the transcript, and moving it would mark a
         // real user message delivered and drop it.
-        const resumedMessage = loggedMessages.findLast(
-          (message) => message.seq <= Math.max(deliveredThrough, consumedInTranscript),
-        );
+        // A regenerate (#1317) answers the last user message ON THIS BRANCH,
+        // which the delivery cursor alone cannot name: messages delivered on
+        // another branch since are newer. The branch's own transcript can.
+        const resumedThrough = branching.regenerated
+          ? consumedInTranscript
+          : Math.max(deliveredThrough, consumedInTranscript);
+        const resumedMessage = loggedMessages.findLast((message) => message.seq <= resumedThrough);
         const resumedTurnText = resumedMessage?.text ?? meta.prompt;
         const repair = await buildSkillPreload({
           text: resumedTurnText,
@@ -2453,9 +2586,14 @@ async function executeSession(
       // Over the context budget is deterministic for this transcript: settle
       // once, without counting an unattended attempt or retrying it.
       const contextBlocked = contextBudgetReason(error) !== undefined;
+      // Course versions (#1317): what this run left, finished or not. A stopped
+      // run's half-built course is a version like any other, so its branch can
+      // be switched back to and continued.
+      const courseVersions = await recordRunBoundary('after_run', status);
       emit(LIFECYCLE.sessionEnd, {
         status,
         toolCalls,
+        ...(courseVersions.length > 0 ? { courseVersions } : {}),
         ...(error
           ? {
               error,
