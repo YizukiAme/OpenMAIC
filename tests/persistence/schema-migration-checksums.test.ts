@@ -403,6 +403,14 @@ const SHIPPED: readonly (readonly [
     true,
     'c71e6f11af3f4185aeb490b762d9a2b6ccb88e7cbd5c5251254500aac46e08c9',
   ],
+  // Edit-and-resend prototype (#1317): the course version tables.
+  [
+    'course-versions',
+    1,
+    'baseline',
+    false,
+    'c9f37030c3a52ade2637755b5d32088ec23e70e39ae02511645a3fcebf5e1513',
+  ],
 ];
 
 /**

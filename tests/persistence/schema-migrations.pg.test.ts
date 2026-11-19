@@ -24,6 +24,7 @@ import { ensureGenerationRunSchema } from '@/lib/persistence/generation-runs';
 import { startSchemaBootCheck } from '@/lib/persistence/schema-boot-check';
 import { withSchemaBootstrapLock } from '@/lib/persistence/schema-bootstrap-lock';
 import { ensureSessionMaterialLinkSchema } from '@/lib/persistence/session-material-links';
+import { ensureCourseVersionSchema } from '@/lib/server/course-versions/store';
 import { APP_SCHEMA_STORES } from '@/lib/persistence/schema-stores';
 import { getServerPersistenceProvider } from '@/lib/persistence/server-provider';
 
@@ -82,6 +83,7 @@ describe.skipIf(!contractUrl)('versioned schema migrations at boot (PostgreSQL)'
       await withSchemaBootstrapLock(locked, ensureUserSkillSchema);
       await withSchemaBootstrapLock(locked, ensureGenerationRunSchema);
       await withSchemaBootstrapLock(locked, ensureSandboxEnvironmentSchema);
+      await withSchemaBootstrapLock(locked, ensureCourseVersionSchema);
     } finally {
       await pool.end().catch(() => {});
     }

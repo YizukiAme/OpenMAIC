@@ -28,6 +28,7 @@ import { PBL_PROJECT_MIGRATIONS } from './pbl-projects';
 import { PBL_MIGRATIONS } from './pbl-studies';
 import { SESSION_MATERIAL_LINK_MIGRATIONS } from './session-material-links';
 import { STAGE_META_MIGRATIONS } from './stage-meta';
+import { COURSE_VERSION_MIGRATIONS } from '@/lib/server/course-versions/store';
 import { WORKSPACE_MODEL_CONFIG_MIGRATIONS } from './workspace-model-config';
 
 export const APP_SCHEMA_STORES: readonly SchemaMigrationSet[] = [
@@ -49,4 +50,6 @@ export const APP_SCHEMA_STORES: readonly SchemaMigrationSet[] = [
   SANDBOX_ENVIRONMENT_MIGRATIONS,
   PBL_PROJECT_MIGRATIONS,
   PBL_MIGRATIONS,
+  // Edit-and-resend prototype (#1317): provisioned lazily by the agent runner.
+  COURSE_VERSION_MIGRATIONS,
 ];
