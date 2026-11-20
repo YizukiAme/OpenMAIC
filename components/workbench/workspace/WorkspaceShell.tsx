@@ -1240,7 +1240,7 @@ function WorkspaceShellController({ initialPanes }: { readonly initialPanes: Wor
   // Course links in first-seen order — each stage opens at most once per session.
   const stageLinkStageIds = useWorkbenchStore((s) => s.stageLinkStageIds);
   const historicalCourseActivity = useWorkbenchStore(
-    (s) => s.replaying || s.branch?.viewingHistory === true,
+    (s) => s.replaying || Boolean(s.branchPreview) || s.branch?.viewingHistory === true,
   );
   const replayedStageLinkCount = useWorkbenchStore((s) => s.replayedStageLinkCount);
   // Serialize only provenance ids: streaming text changes must not restart the
@@ -1887,10 +1887,9 @@ function WorkspaceShellController({ initialPanes }: { readonly initialPanes: Wor
   const courseNavigation = useMemo<WorkbenchCourseNavigation>(
     () => ({
       openCourse,
-      followBranchCourse: (checkedOut) =>
+      followBranchCourse: (chat, checkedOut) =>
         navigateInBackground(
-          (current) =>
-            panesAfterBranchSwitch(panes, current, useWorkbenchStore.getState().chat, checkedOut),
+          (current) => panesAfterBranchSwitch(panes, current, chat, checkedOut),
           'replace',
         ),
       activeCourseId: panes.courseId,

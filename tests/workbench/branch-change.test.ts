@@ -106,6 +106,11 @@ describe('following a branch in the open classroom', () => {
     });
   });
 
+  it('follows the historical conversation’s course while browsing without a checkout', () => {
+    expect(panesAfterBranchSwitch(open, open, chat)).toEqual({ ...open, courseId: 'wanted' });
+    expect(panesAfterBranchSwitch(closed, closed, chat)).toBeNull();
+  });
+
   it('leaves a chat-only workspace alone', () => {
     expect(panesAfterBranchSwitch(closed, closed, chat, checkedOut)).toBeNull();
   });

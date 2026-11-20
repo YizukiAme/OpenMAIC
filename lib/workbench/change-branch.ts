@@ -17,17 +17,16 @@ export function panesAfterBranchSwitch(
   started: WorkspacePanes,
   current: WorkspacePanes,
   chat: readonly ChatNode[],
-  checkedOut: BranchReceipt['checkedOut'],
+  checkedOut?: BranchReceipt['checkedOut'],
 ): WorkspacePanes | null {
   if (!current.courseId || !samePanes(started, current)) return null;
-  const available =
-    checkedOut?.filter((course) => course.outcome !== 'missing').map((course) => course.stageId) ??
-    [];
-  const card = chat.findLast(
-    (node) => node.kind === 'course' && node.stageIds?.some((id) => available.includes(id)),
-  );
-  const choices = card?.stageIds?.filter((id) => available.includes(id)) ?? available;
-  if (!choices.length || choices.includes(current.courseId)) return null;
+  const available = checkedOut
+    ?.filter((course) => course.outcome !== 'missing')
+    .map((course) => course.stageId);
+  const onBranch = (id: string) => !available || available.includes(id);
+  const card = chat.findLast((node) => node.kind === 'course' && node.stageIds?.some(onBranch));
+  const choices = card?.stageIds?.filter(onBranch) ?? available;
+  if (!choices?.length || choices.includes(current.courseId)) return null;
   return withCourse(current, choices[0]);
 }
 

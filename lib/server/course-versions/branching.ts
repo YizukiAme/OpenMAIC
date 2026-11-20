@@ -66,7 +66,6 @@ export async function recordCourseVersions(
     phase: CourseVersionsEntryData['phase'];
     status?: string;
     extraStageIds?: Iterable<string>;
-    requestSeq?: number;
   },
 ): Promise<CourseVersionsEntryData['versions']> {
   const path = (await deps.session.getBranch()) as unknown as TreeEntry[];
@@ -78,7 +77,6 @@ export async function recordCourseVersions(
   );
   const previous = lastVersionBoundary(path);
   if (
-    input.requestSeq !== undefined ||
     !previous ||
     previous.unavailable ||
     versions.some(({ stageId, versionId }) => onPath.get(stageId) !== versionId)
@@ -88,7 +86,6 @@ export async function recordCourseVersions(
         phase: input.phase,
         versions,
         ...(input.status ? { status: input.status } : {}),
-        ...(input.requestSeq !== undefined ? { requestSeq: input.requestSeq } : {}),
       });
     });
   }

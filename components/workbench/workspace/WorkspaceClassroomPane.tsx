@@ -123,7 +123,7 @@ export const WorkspaceClassroomPane = memo(function WorkspaceClassroomPane({
   readonly onTalkAboutCourse?: () => void;
 }) {
   const courseId = browser.activeCourseId;
-  const preview = useWorkbenchStore((s) => s.branchPreview);
+  const preview = useWorkbenchStore((s) => s.branchPreview?.request);
   const sessionId = useWorkbenchStore((s) => s.sessionId);
   const previewUrl =
     preview && sessionId

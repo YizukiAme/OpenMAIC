@@ -126,42 +126,18 @@ export function findUserEntry(entries: readonly TreeEntry[], seq: number): TreeE
   return undefined;
 }
 
-/** Conversation-node children of every node, in append order. */
-export function childrenOf(entries: readonly TreeEntry[]): Map<string | null, TreeEntry[]> {
-  const children = new Map<string | null, TreeEntry[]>();
-  for (const entry of entries) {
-    if (!isConversationNode(entry)) continue;
-    const list = children.get(entry.parentId) ?? [];
-    list.push(entry);
-    children.set(entry.parentId, list);
-  }
-  return children;
-}
-
-/**
- * The most recently written end of the subtree under `rootId`: where a branch
- * continues when the conversation switches back to it.
- */
+/** Entries are in append order, with every parent before its children.
+ * The last descendant in that order is necessarily a leaf. */
 export function latestLeafUnder(entries: readonly TreeEntry[], rootId: string): string {
-  const children = childrenOf(entries);
-  const order = new Map(entries.map((entry, index) => [entry.id, index]));
-  let best = rootId;
-  let bestOrder = -1;
-  const stack = [rootId];
-  while (stack.length > 0) {
-    const id = stack.pop()!;
-    const below = children.get(id) ?? [];
-    if (below.length === 0) {
-      const at = order.get(id) ?? -1;
-      if (at > bestOrder) {
-        best = id;
-        bestOrder = at;
-      }
-      continue;
+  const descendants = new Set([rootId]);
+  let latest = rootId;
+  for (const entry of entries) {
+    if (entry.parentId !== null && descendants.has(entry.parentId) && isConversationNode(entry)) {
+      descendants.add(entry.id);
+      latest = entry.id;
     }
-    for (const child of below) stack.push(child.id);
   }
-  return best;
+  return latest;
 }
 
 /**
@@ -174,15 +150,18 @@ export function replyVariantChild(
   userEntryId: string,
   variant: number | 'orig',
 ): TreeEntry | undefined {
-  const below = childrenOf(entries).get(userEntryId) ?? [];
+  const child = (entry: TreeEntry) => entry.parentId === userEntryId && isConversationNode(entry);
   if (variant === 'orig') {
-    return below.find((entry) => customOf(entry, REPLY_VARIANT_ENTRY) === undefined);
+    return entries.find(
+      (entry) => child(entry) && customOf(entry, REPLY_VARIANT_ENTRY) === undefined,
+    );
   }
-  for (let index = below.length - 1; index >= 0; index -= 1) {
-    const data = customOf(below[index]!, REPLY_VARIANT_ENTRY) as ReplyVariantEntryData | undefined;
-    if (data?.requestSeq === variant) return below[index];
-  }
-  return undefined;
+  return entries.findLast(
+    (entry) =>
+      child(entry) &&
+      (customOf(entry, REPLY_VARIANT_ENTRY) as ReplyVariantEntryData | undefined)?.requestSeq ===
+        variant,
+  );
 }
 
 export type BranchOp = 'regenerate' | 'edit' | 'switch';

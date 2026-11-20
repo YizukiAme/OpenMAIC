@@ -60,6 +60,7 @@ const mocks = vi.hoisted(() => ({
   homeProps: null as Record<string, unknown> | null,
   libraryProps: null as Record<string, unknown> | null,
   store: {
+    branchPreview: null as { request: { op: 'switch'; targetSeq: number } } | null,
     playbackOn: false,
     sessionId: null as string | null,
     status: 'succeeded' as
@@ -342,6 +343,7 @@ beforeEach(() => {
   mocks.ownerClient = null;
   mocks.unconfirmedSessionTitles.clear();
   mocks.store.sessionId = null;
+  mocks.store.branchPreview = null;
   mocks.store.stageId = null;
   mocks.store.existingCourse = false;
   mocks.store.status = 'succeeded';
@@ -432,6 +434,25 @@ describe('opening a course while a request preview is the active tab', () => {
     expect(mocks.classroomProps?.hidden).toBe(false);
     expect(mocks.previewHidden).toBe(true);
     expect(container!.querySelector('[data-testid="request-preview"]')).not.toBeNull();
+  });
+
+  it('keeps the selected historical classroom on screen when the live request starts a course', async () => {
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    mocks.searchParams = new URLSearchParams('session=ses-1&course=stage-1');
+    mocks.sessionRows = [{ id: 'ses-1', stageId: 'stage-new', updatedAt: 1 }];
+    mocks.store.sessionId = 'ses-1';
+    mocks.store.status = 'running';
+    mocks.store.branchPreview = { request: { op: 'switch', targetSeq: 1 } };
+    await render();
+    expect(mocks.classroomProps?.hidden).toBe(false);
+    expect(container!.querySelector('[data-testid="request-preview"]')).toBeNull();
   });
 
   it('lets the preview of a conversation reloaded beside its course take focus once, like any request', async () => {

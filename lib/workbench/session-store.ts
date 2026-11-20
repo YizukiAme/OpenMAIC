@@ -28,6 +28,7 @@ import {
   initialBranchState,
   markRunEnd,
   recordBranchProgress,
+  type BranchPreview,
   type BranchReceipt,
   type BranchState,
 } from './branch-fold';
@@ -479,7 +480,7 @@ export interface WorkbenchSessionState extends WorkbenchFold {
   /** The editor whose local changes are being saved for a branch request. */
   branchEditStageId: string | null;
   /** A local view of a saved branch while another reply owns the live course. */
-  branchPreview: Extract<WorkbenchBranchRequest, { op: 'switch' }> | null;
+  branchPreview: BranchPreview | null;
   /**
    * Whether the conversation was started beside an existing course: the
    * session's durable `existingCourse` flag, from the sessions list or the

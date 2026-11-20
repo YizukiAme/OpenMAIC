@@ -121,10 +121,10 @@ describe.skipIf(!contractUrl)('course versions (#1317 prototype)', () => {
       const original = (await snapshot())!.id;
       await store.saveDocument(course(STAGE, [base[2]!]));
       const before = await manifest();
-      const preview = await readCourseVersion(db.queryable, OWNER, [original], STAGE);
+      const preview = await readCourseVersion(db.queryable, OWNER, original);
       expect(preview?.scenes.map((s) => s.id)).toEqual(base.map((s) => s.id));
       expect(await manifest()).toEqual(before);
-      expect(await readCourseVersion(db.queryable, 'other-owner', [original], STAGE)).toBeNull();
+      expect(await readCourseVersion(db.queryable, 'other-owner', original)).toBeNull();
     });
 
     it('reuses one version across concurrent snapshots, same-content saves and checkouts', async () => {

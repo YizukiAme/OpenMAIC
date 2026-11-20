@@ -97,7 +97,7 @@ export function userSegmentOf(state: BranchState, userSeq: number): BranchSegmen
 }
 
 /** The segments on screen, root first. */
-export function activePath(state: BranchState): BranchSegment[] {
+export function activePath(state: Pick<BranchState, 'segments'>): BranchSegment[] {
   const path: BranchSegment[] = [];
   let segment: BranchSegment | undefined = state.segments[ROOT_SEGMENT];
   while (segment) {
@@ -108,10 +108,10 @@ export function activePath(state: BranchState): BranchSegment[] {
 }
 
 /** Project the selected path. Browsing uses the same projection without changing the live fold. */
-export function checkoutBranch<T extends Pick<WorkbenchFold, 'branch' | 'chat'>>(
-  fold: T,
+export function checkoutBranch(
+  fold: WorkbenchFold,
   request: Pick<WorkbenchEvent, 'data' | 'id'> | Extract<WorkbenchBranchRequest, { op: 'switch' }>,
-) {
+): WorkbenchFold {
   const state = fold.branch!;
   const { op, targetSeq, variant } = ('data' in request ? request.data : request) as {
     op: string;
@@ -136,13 +136,14 @@ export function checkoutBranch<T extends Pick<WorkbenchFold, 'branch' | 'chat'>>
   for (const segment of activePath(state)) saved[segment.id] = [];
   for (const node of fold.chat) saved[node.segment ?? ROOT_SEGMENT]!.push(node);
 
-  let branch: BranchState = { ...state, saved, current: target };
-  let child = branch.segments[target]!;
+  const segments = { ...state.segments };
+  let child = segments[target]!;
   while (child.parent) {
-    const id = child.id;
-    branch = update(branch, child.parent, (parent) => ({ ...parent, selected: id }));
-    child = branch.segments[child.parent]!;
+    const parent = segments[child.parent]!;
+    if (parent.selected !== child.id) segments[parent.id] = { ...parent, selected: child.id };
+    child = parent;
   }
+  let branch: BranchState = { ...state, segments, saved, current: target };
   if (op === 'regenerate' && 'id' in request)
     branch = startSegment(branch, 'reply', { variant: request.id });
   else if (op === 'edit')
@@ -271,7 +272,10 @@ export interface BranchView {
   segments: Readonly<Record<string, BranchSegment>>;
 }
 
-export function projectBranchChat(chat: ChatNode[], state: BranchState): BranchView {
+export function projectBranchChat(
+  chat: ChatNode[],
+  state: Pick<BranchState, 'segments'>,
+): BranchView {
   const path = activePath(state);
   const forks = new Map<string, BranchFork>();
   for (const segment of path) {
@@ -291,4 +295,22 @@ export function projectBranchChat(chat: ChatNode[], state: BranchState): BranchV
     }
   }
   return { chat, forks, segments: state.segments };
+}
+
+/** Capture what the reader opened once. Streamed events continue to update the live fold. */
+export interface BranchPreview {
+  request: Extract<WorkbenchBranchRequest, { op: 'switch' }>;
+  chat: ChatNode[];
+  segments: BranchState['segments'];
+  plan: CourseProgress['plan'];
+}
+
+export function previewBranch(
+  fold: WorkbenchFold,
+  request: BranchPreview['request'],
+): BranchPreview | null {
+  if (!fold.branch) return null;
+  const selected = checkoutBranch(fold, request);
+  if (!selected.branch || selected.branch.current === fold.branch.current) return null;
+  return { request, chat: selected.chat, segments: selected.branch.segments, plan: selected.plan };
 }

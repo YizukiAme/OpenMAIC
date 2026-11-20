@@ -234,16 +234,11 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     const move = planBranchMove(await tree.getEntries(), request, 0);
     if (move.kind !== 'move') return new Response('Not found', { status: 404, headers });
     const path = await tree.getPathToRoot(move.leafId);
-    const versions = courseVersionsOnPath(path);
-    if (!versions.size || lastVersionBoundary(path)?.unavailable)
+    const versionId = courseVersionsOnPath(path).get(query.get('course') ?? '');
+    if (!versionId || lastVersionBoundary(path)?.unavailable)
       return NextResponse.json(null, { headers });
     const { pool } = await getServerPersistenceProvider(process.env.DATABASE_URL ?? '');
-    const preview = await readCourseVersion(
-      pool,
-      ownerId,
-      [...versions.values()],
-      query.get('course'),
-    );
+    const preview = await readCourseVersion(pool, ownerId, versionId);
     return NextResponse.json(preview, { headers });
   });
 }

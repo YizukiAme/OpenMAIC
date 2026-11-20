@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { projectBranchChat, userSeqOfNodeKey } from '@/lib/workbench/branch-fold';
+import { previewBranch, projectBranchChat, userSeqOfNodeKey } from '@/lib/workbench/branch-fold';
 import { foldEvent, type WorkbenchEvent, type WorkbenchFold } from '@/lib/workbench/session-store';
 
 let seq = 0;
@@ -150,6 +150,24 @@ describe('branch fold', () => {
     state = foldEvent(state, ev('user_message', { text: 'make it shorter', delivery: 'queued' }));
     expect(onScreen(state).slice(-2)).toEqual(['added a video', '> make it shorter']);
     expect(state.branch?.viewingHistory).toBe(false);
+  });
+
+  it('keeps a read-only branch while new messages continue on the live one', () => {
+    const events = conversation();
+    const targetSeq = events.find((event) => event.type === 'user_message')!.id;
+    const regen = ev('branch_request', { op: 'regenerate', targetSeq });
+    const live = [...events, regen, applied(regen), ...reply('animation')].reduce(
+      foldEvent,
+      blankFold,
+    );
+    const preview = previewBranch(live, { op: 'switch', targetSeq, variant: 'orig' })!;
+    const continued = foldEvent(
+      live,
+      ev('user_message', { text: 'continue the animation', delivery: 'queued' }),
+    );
+    expect(preview.chat.at(-1)?.text).toBe('added a video');
+    expect(onScreen(continued).slice(-2)).toEqual(['animation', '> continue the animation']);
+    expect(previewBranch(continued, { op: 'switch', targetSeq, variant: regen.id })).toBeNull();
   });
 
   it('puts an edited message beside the original with its own reply', () => {
