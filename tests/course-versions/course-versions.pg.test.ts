@@ -32,6 +32,7 @@ import {
   checkoutCourseVersion,
   ensureCourseVersionSchema,
   snapshotCourse,
+  readCourseVersion,
   type CourseVersionDatabase,
 } from '@/lib/server/course-versions/store';
 import { agentSessionStoreIn, nodePostgresTransaction } from '@/lib/server/agent-runtime/store';
@@ -112,6 +113,18 @@ describe.skipIf(!contractUrl)('course versions (#1317 prototype)', () => {
       expect(await documents().loadDocument(STAGE)).not.toBeNull();
       expect(await snapshot()).toBeNull();
       expect((await pool.query('SELECT id FROM course_versions')).rows).toEqual([]);
+    });
+
+    it('lets only the owner read saved pages in order without rewinding the live course', async () => {
+      const store = documents();
+      await store.saveDocument(course(STAGE, base));
+      const original = (await snapshot())!.id;
+      await store.saveDocument(course(STAGE, [base[2]!]));
+      const before = await manifest();
+      const preview = await readCourseVersion(db.queryable, OWNER, [original], STAGE);
+      expect(preview?.scenes.map((s) => s.id)).toEqual(base.map((s) => s.id));
+      expect(await manifest()).toEqual(before);
+      expect(await readCourseVersion(db.queryable, 'other-owner', [original], STAGE)).toBeNull();
     });
 
     it('reuses one version across concurrent snapshots, same-content saves and checkouts', async () => {

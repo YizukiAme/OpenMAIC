@@ -259,6 +259,7 @@ export interface TimelineBranch {
   forks: ReadonlyMap<string, BranchFork>;
   /** A branch request is on its way: every control waits for it. */
   disabled: boolean;
+  browsingOnly?: boolean;
   /** Send `text` as a new version of user message `userSeq`; resolves whether it was accepted. */
   onEdit: (userSeq: number, text: string) => Promise<boolean>;
   onRegenerate: (userSeq: number) => void;
@@ -325,7 +326,7 @@ export function ChatTimeline({
       return view;
     const userSeq = segment.userSeq;
     const fork = branch.forks.get(segment.id);
-    if (editingKey === node.key) {
+    if (!branch.browsingOnly && editingKey === node.key) {
       return (
         <UserBubbleEditor
           key={row.key}
@@ -347,8 +348,11 @@ export function ChatTimeline({
         <UserTurnControls
           fork={fork}
           // The opening prompt starts the session; the prototype edits follow-ups only.
-          // A run still writing is no reason to hide it: the request stops the run first.
-          editable={userSeq > 0 && branch.segments[segment.parent ?? '']?.kind !== 'root'}
+          editable={
+            !branch.browsingOnly &&
+            userSeq > 0 &&
+            branch.segments[segment.parent ?? '']?.kind !== 'root'
+          }
           disabled={branch.disabled}
           onEdit={() => setEditingKey(node.key)}
           onSelect={(index) => {
@@ -369,13 +373,13 @@ export function ChatTimeline({
     const userSeq = branch.segments[segment.parent]?.userSeq;
     if (userSeq === undefined) return null;
     const live = turnActive && segmentId === lastSegment;
-    if (live) return null;
+
     const fork = branch.forks.get(segmentId);
     return (
       <ReplyTurnControls
         key={`branch-${segmentId}`}
         fork={fork}
-        canRegenerate
+        canRegenerate={!live && !branch.browsingOnly}
         disabled={branch.disabled}
         onRegenerate={() => branch.onRegenerate(userSeq)}
         onSelect={(index) => {
@@ -397,7 +401,7 @@ export function ChatTimeline({
     if (segment?.kind === 'user' && segment.selected && segment.selected !== nextSegment) {
       // A completed reply can have only hidden tools, or no visible content.
       // Its user row still owns the way back to the other versions.
-      if (branch?.segments[segment.selected]?.endStatus)
+      if (branch?.segments[segment.selected]?.endStatus || branch?.forks.has(segment.selected))
         rendered.push(replyControls(segment.selected));
     } else {
       rendered.push(replyControls(segmentId));

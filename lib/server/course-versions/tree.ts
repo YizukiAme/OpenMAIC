@@ -78,6 +78,12 @@ export function isConversationNode(entry: TreeEntry): boolean {
   return entry.type !== 'leaf' && entry.type !== 'label';
 }
 
+export function lastVersionBoundary(path: readonly TreeEntry[]) {
+  return path.findLast(
+    (entry) => entry.type === 'custom' && entry.customType === COURSE_VERSIONS_ENTRY,
+  )?.data as CourseVersionsEntryData | undefined;
+}
+
 /** Per course, the version the path's leaf is on (the nearest entry wins). */
 export function courseVersionsOnPath(path: readonly TreeEntry[]): Map<string, string> {
   const versions = new Map<string, string>();

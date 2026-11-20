@@ -382,3 +382,21 @@ export async function checkoutCourseVersion(
     return changedDocument ? 'restored' : 'unchanged';
   });
 }
+
+/** Read one immutable course, preferring the open tab when the branch has several. */
+export async function readCourseVersion(
+  db: Queryable,
+  ownerId: string,
+  versions: string[],
+  preferredCourse: string | null,
+) {
+  const result = await db.query<{ stage: MaicDocument['stage']; scenes: MaicDocument['scenes'] }>(
+    `SELECT v.stage, ARRAY(SELECT p.data FROM jsonb_array_elements(v.pages) WITH ORDINALITY page(ref, pos)
+          JOIN course_version_pages p ON p.content_hash = page.ref->>'hash' ORDER BY page.pos) AS scenes
+       FROM course_versions v JOIN stage_meta m ON m.stage_id = v.stage_id
+      WHERE v.id = ANY($1) AND m.owner_id = $2 AND m.deleted_at IS NULL
+      ORDER BY (v.stage_id = $3) DESC, v.stage_id LIMIT 1`,
+    [versions, ownerId, preferredCourse],
+  );
+  return result.rows[0] ?? null;
+}

@@ -136,7 +136,10 @@ function driveARunningSession(): void {
   store.setAttached(true);
   store.setError('stream hiccup');
   store.setPlaybackOn(true);
-  useWorkbenchStore.setState({ branchEditStageId: 'stage-a' });
+  useWorkbenchStore.setState({
+    branchEditStageId: 'stage-a',
+    branchPreview: { op: 'switch', targetSeq: 7 },
+  });
   // `byUser` so the pin is dirty too — the fold only ever raises `panelOpen`.
   store.setPanelOpen(true, true);
 }

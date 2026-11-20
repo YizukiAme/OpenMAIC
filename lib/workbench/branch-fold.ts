@@ -2,7 +2,13 @@
  * user message or one of its replies. A checkout stores the outgoing rows and
  * puts the selected path back in the ordinary workbench fold, shared by the
  * transcript, the question form and the course preview. */
-import type { ChatNode, SessionStatus, WorkbenchEvent, WorkbenchFold } from './session-store';
+import type {
+  ChatNode,
+  SessionStatus,
+  WorkbenchEvent,
+  WorkbenchFold,
+  WorkbenchBranchRequest,
+} from './session-store';
 
 type CourseProgress = Pick<WorkbenchFold, 'plan' | 'pages' | 'courseTitle'>;
 export const ROOT_SEGMENT = 'root';
@@ -101,10 +107,13 @@ export function activePath(state: BranchState): BranchSegment[] {
   return path;
 }
 
-/** Apply a confirmed request, saving the current path before selecting the target. */
-export function checkoutBranch(fold: WorkbenchFold, request: WorkbenchEvent): WorkbenchFold {
+/** Project the selected path. Browsing uses the same projection without changing the live fold. */
+export function checkoutBranch<T extends Pick<WorkbenchFold, 'branch' | 'chat'>>(
+  fold: T,
+  request: Pick<WorkbenchEvent, 'data' | 'id'> | Extract<WorkbenchBranchRequest, { op: 'switch' }>,
+) {
   const state = fold.branch!;
-  const { op, targetSeq, variant } = request.data as {
+  const { op, targetSeq, variant } = ('data' in request ? request.data : request) as {
     op: string;
     targetSeq: number;
     variant?: number | 'orig';
@@ -134,7 +143,8 @@ export function checkoutBranch(fold: WorkbenchFold, request: WorkbenchEvent): Wo
     branch = update(branch, child.parent, (parent) => ({ ...parent, selected: id }));
     child = branch.segments[child.parent]!;
   }
-  if (op === 'regenerate') branch = startSegment(branch, 'reply', { variant: request.id });
+  if (op === 'regenerate' && 'id' in request)
+    branch = startSegment(branch, 'reply', { variant: request.id });
   else if (op === 'edit')
     branch = update(branch, target, (parent) => ({ ...parent, selected: null }));
   const path = activePath(branch);

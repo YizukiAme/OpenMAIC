@@ -70,6 +70,7 @@ function render(state: WorkbenchFold, turnActive = false, withBranch = true) {
     segments: view.segments,
     forks: view.forks,
     disabled: false,
+    browsingOnly: turnActive,
     onEdit: async () => true,
     onRegenerate: () => {},
     onSwitchUser: () => {},
@@ -206,7 +207,7 @@ describe('branch controls on the timeline', () => {
     expect(render(state)).not.toContain('data-testid="branch-user-controls"');
   });
 
-  it('keeps controls off the reply that is still being written, and only that one', () => {
+  it('leaves only version browsing available during a run', () => {
     seq = 0;
     const state = [ev('session_start', { prompt: 'make a lesson' }, 1), ...reply('writing')].reduce(
       foldEvent,
@@ -214,16 +215,15 @@ describe('branch controls on the timeline', () => {
     );
     expect(render(state, true)).not.toContain('data-testid="branch-reply-controls"');
 
-    // Earlier replies and messages stay usable while a run writes: a request
-    // made now stops the run first.
+    // A running conversation without forks offers no branch actions.
     const live = [
       ...base(),
       ev('user_message', { text: 'one more page', delivery: 'queued' }),
       ...reply('writing page 4'),
     ].reduce(foldEvent, blankFold);
     const html = render(live, true);
-    expect(html.match(/data-testid="branch-reply-controls"/g)).toHaveLength(2);
-    expect(html.match(/data-testid="branch-user-controls"/g)).toHaveLength(2);
+    expect(html).not.toContain('data-testid="branch-reply-controls"');
+    expect(html).not.toContain('data-testid="branch-user-controls"');
   });
 });
 

@@ -48,37 +48,30 @@ describe('changing the selected branch', () => {
     await expect(change).resolves.toEqual(receipt);
   });
 
-  it('waits for the cancelled server run even when the local fold still looks terminal', async () => {
-    vi.useFakeTimers();
-    useWorkbenchStore.getState().attach('a', null);
-    useWorkbenchStore.setState({ status: 'succeeded' });
-    let polled = 0;
-    const urls: string[] = [];
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async (url: string) => {
-        urls.push(url);
-        if (url.endsWith('/cancel'))
-          return Response.json({ cancelRequested: true }, { status: 202 });
-        if (url.endsWith('/branch')) return Response.json({ requestSeq: 6 }, { status: 202 });
-        return Response.json({ status: ++polled === 1 ? 'running' : 'cancelled' });
-      }),
-    );
-    const change = changeWorkbenchBranch(
-      'a',
-      { op: 'regenerate', targetSeq: 0 },
-      { pendingSend: true },
-    );
-    await vi.advanceTimersByTimeAsync(1);
-    expect(urls).toEqual(['/api/agent/sessions/a/cancel', '/api/agent/sessions/a']);
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(urls.at(-1)).toBe('/api/agent/sessions/a/branch');
-    useWorkbenchStore.getState().detach();
-    await expect(change).resolves.toBeNull();
-  });
+  it.each(['running', 'pending send'] as const)(
+    'never cancels a %s reply for a branch action',
+    async (phase) => {
+      useWorkbenchStore.getState().attach('a', null);
+      useWorkbenchStore.setState({ status: phase === 'running' ? 'running' : 'succeeded' });
+      const fetch = vi.fn();
+      vi.stubGlobal('fetch', fetch);
+      for (const request of [
+        { op: 'switch', targetSeq: 1 },
+        { op: 'regenerate', targetSeq: 1 },
+        { op: 'edit', targetSeq: 1, text: 'edited' },
+      ] as const) {
+        await expect(
+          changeWorkbenchBranch('a', request, { pendingSend: phase === 'pending send' }),
+        ).rejects.toMatchObject({ errorCode: 'SESSION_BUSY' });
+      }
+      expect(fetch).not.toHaveBeenCalled();
+      expect(flushStageSave).not.toHaveBeenCalled();
+    },
+  );
 
   it('abandons a waiting action when the user opens another conversation', async () => {
     useWorkbenchStore.getState().attach('a', null);
+    useWorkbenchStore.setState({ status: 'succeeded' });
     let finish!: () => void;
     const fetch = vi.fn(
       () =>
@@ -88,6 +81,7 @@ describe('changing the selected branch', () => {
     );
     vi.stubGlobal('fetch', fetch);
     const change = changeWorkbenchBranch('a', { op: 'regenerate', targetSeq: 0 });
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
     useWorkbenchStore.getState().attach('b', null);
     finish();
     await expect(change).resolves.toBeNull();

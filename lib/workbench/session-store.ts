@@ -478,6 +478,8 @@ export interface WorkbenchSessionState extends WorkbenchFold {
   attached: boolean;
   /** The editor whose local changes are being saved for a branch request. */
   branchEditStageId: string | null;
+  /** A local view of a saved branch while another reply owns the live course. */
+  branchPreview: Extract<WorkbenchBranchRequest, { op: 'switch' }> | null;
   /**
    * Whether the conversation was started beside an existing course: the
    * session's durable `existingCourse` flag, from the sessions list or the
@@ -611,6 +613,7 @@ export function createInitialSessionState(): WorkbenchSessionState {
     // in. `attach()` arms it explicitly instead.
     replaying: false,
     branchEditStageId: null,
+    branchPreview: null,
     replayedStageLinkCount: 0,
     playbackOn: false,
     // ── The run ─────────────────────────────────────────────────────────

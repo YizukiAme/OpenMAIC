@@ -13,6 +13,7 @@ import {
   beforeSwitchEntryOf,
   courseVersionsOnPath,
   findUserEntry,
+  lastVersionBoundary,
   parseBranchRequest,
   planBranchMove,
   type BranchOp,
@@ -55,12 +56,6 @@ async function snapshotStages(
     if (record) versions.push({ stageId, versionId: record.id });
   }
   return versions;
-}
-
-function lastVersionBoundary(path: readonly TreeEntry[]) {
-  return path.findLast(
-    (entry) => entry.type === 'custom' && entry.customType === COURSE_VERSIONS_ENTRY,
-  )?.data as CourseVersionsEntryData | undefined;
 }
 
 /** Save hand edits and tool writes at a turn boundary. An empty first snapshot

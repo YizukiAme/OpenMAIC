@@ -32,6 +32,7 @@ import {
   type ClassroomMode,
 } from '@/lib/workbench/classroom-mode';
 import { cn } from '@/lib/utils/cn';
+import { BranchCoursePreview } from './BranchCoursePreview';
 import { ClassroomSurface } from '@/components/classroom/ClassroomSurface';
 import { useStageStore } from '@/lib/store/stage';
 import { useWorkbenchStore } from '@/lib/workbench/session-store';
@@ -122,6 +123,16 @@ export const WorkspaceClassroomPane = memo(function WorkspaceClassroomPane({
   readonly onTalkAboutCourse?: () => void;
 }) {
   const courseId = browser.activeCourseId;
+  const preview = useWorkbenchStore((s) => s.branchPreview);
+  const sessionId = useWorkbenchStore((s) => s.sessionId);
+  const previewUrl =
+    preview && sessionId
+      ? `/api/agent/sessions/${encodeURIComponent(sessionId)}/branch?${new URLSearchParams({
+          targetSeq: String(preview.targetSeq),
+          course: courseId,
+          ...(preview.variant === undefined ? {} : { variant: String(preview.variant) }),
+        })}`
+      : null;
   const { t } = useI18n();
   const scenes = useStageStore((s) => s.scenes);
   const currentSceneId = useStageStore((s) => s.currentSceneId);
@@ -154,6 +165,7 @@ export const WorkspaceClassroomPane = memo(function WorkspaceClassroomPane({
     !stageReadOnly &&
     !readOnly &&
     !courseGenerating &&
+    !preview &&
     !changingVersion &&
     !restoring &&
     scenes.length > 0;
@@ -192,7 +204,9 @@ export const WorkspaceClassroomPane = memo(function WorkspaceClassroomPane({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [fullscreen, hidden, setFullscreen]);
 
-  const modeSwitch = (
+  const modeSwitch = preview ? (
+    <ReadOnlyBadge />
+  ) : (
     <ClassroomModeSwitch
       learning={learning}
       editingAllowed={editingAllowed}
@@ -331,7 +345,7 @@ export const WorkspaceClassroomPane = memo(function WorkspaceClassroomPane({
           {/* Export, as in the full-screen header: the download menu must not
               hide behind full screen. Only once the tab's course is the loaded
               one, since it exports the loaded stage. */}
-          {loadedCourseId === courseId ? (
+          {!preview && loadedCourseId === courseId ? (
             <HeaderControls variant="compact" showGlobalControls={false} showCourseActions />
           ) : null}
           {modeSwitch}
@@ -356,7 +370,9 @@ export const WorkspaceClassroomPane = memo(function WorkspaceClassroomPane({
             <>
               {readOnly && readOnlyKnown ? <ReadOnlyBadge /> : null}
               {/* Export, as in the split header. */}
-              <HeaderControls variant="compact" showGlobalControls={false} showCourseActions />
+              {!preview && (
+                <HeaderControls variant="compact" showGlobalControls={false} showCourseActions />
+              )}
               {/* The editor portals its undo/redo here while editing; empty, it
               takes no space. It sits with the other editing control (the
               tour's ?) just before Learn | Edit. */}
@@ -383,7 +399,7 @@ export const WorkspaceClassroomPane = memo(function WorkspaceClassroomPane({
         />
       )}
 
-      {showHint ? <PaneHint /> : null}
+      {showHint && !preview ? <PaneHint /> : null}
       {showEditTour ? (
         <WorkspaceTour
           // Its steps differ by layout: a switch restarts it rather than skip a step.
@@ -402,8 +418,22 @@ export const WorkspaceClassroomPane = memo(function WorkspaceClassroomPane({
       {/* One course surface for both modes and both sizes. Generation and access
           gates override remembered editing without overwriting the course's
           preference. */}
-      <div className="ws-classroom-body relative flex min-h-0 flex-1">
-        <WorkbenchPanelProvider visible={!hidden} learning={learning} historySlot={historySlot}>
+      {previewUrl && !hidden && (
+        <BranchCoursePreview
+          key={previewUrl}
+          url={previewUrl}
+          initialSceneId={currentSceneId}
+          initialIndex={sceneIndex}
+        />
+      )}
+      <div
+        className={cn('ws-classroom-body relative min-h-0 flex-1', previewUrl ? 'hidden' : 'flex')}
+      >
+        <WorkbenchPanelProvider
+          visible={!hidden && !preview}
+          learning={learning}
+          historySlot={historySlot}
+        >
           <ClassroomSurface classroomId={courseId} variant="pane" />
         </WorkbenchPanelProvider>
       </div>

@@ -73,7 +73,7 @@ import {
   type WorkbenchBranchRequest,
   type WorkbenchMaterial,
 } from '@/lib/workbench/session-store';
-import { initialBranchState, projectBranchChat } from '@/lib/workbench/branch-fold';
+import { checkoutBranch, initialBranchState, projectBranchChat } from '@/lib/workbench/branch-fold';
 import { changeWorkbenchBranch } from '@/lib/workbench/change-branch';
 import { flushStageSave, useStageStore } from '@/lib/store/stage';
 import {
@@ -198,14 +198,19 @@ export function WorkbenchChat({
   const canSend = ownerAttached && (sessionId !== null || draftConversation !== null);
   const foldedChat = useWorkbenchStore((s) => s.chat);
   const branchState = useWorkbenchStore((s) => s.branch);
+  const preview = useWorkbenchStore((s) => s.branchPreview);
+  const plan = useWorkbenchStore((s) => s.plan);
+  const viewed = useMemo(() => {
+    const fold = { chat: foldedChat, branch: branchState, plan };
+    return preview && branchState ? checkoutBranch(fold, preview) : fold;
+  }, [foldedChat, branchState, preview, plan]);
   const branchView = useMemo(
-    () => projectBranchChat(foldedChat, branchState ?? initialBranchState()),
-    [foldedChat, branchState],
+    () => projectBranchChat(viewed.chat, viewed.branch ?? initialBranchState()),
+    [viewed],
   );
   const chat = branchView.chat;
   const replaying = useWorkbenchStore((s) => s.replaying);
   const status = useWorkbenchStore((s) => s.status);
-  const plan = useWorkbenchStore((s) => s.plan);
   const panelOpen = useWorkbenchStore((s) => s.panelOpen);
   const effectivePanelOpen = hosted ? adjacentPanelOpen : panelOpen;
   /**
@@ -293,7 +298,7 @@ export function WorkbenchChat({
         ? retainedTranscript.chat
         : [...retainedTranscript.chat, openingMessage]
       : (retainedTranscript?.chat ?? liveChat);
-  const displayedPlan = retainedTranscript?.plan ?? plan;
+  const displayedPlan = retainedTranscript?.plan ?? viewed.plan;
 
   const [draft, setDraft] = useState('');
   /**
@@ -878,7 +883,7 @@ export function WorkbenchChat({
   // The agent's open question, if it is waiting on one. Derived from the same
   // fold the timeline renders, so the composer's form and the transcript's card
   // can never disagree about what was asked or whether it still needs an answer.
-  const pending = pendingQuestion(chat);
+  const pending = preview ? null : pendingQuestion(chat);
   // The composer IS the question while one waits, unless this exact question's
   // form was dismissed. One derived value, so the swap below and the card's way
   // back cannot describe different states.
@@ -1054,9 +1059,19 @@ export function WorkbenchChat({
   }, [busy, ownerAttached, pendingStop, sessionId, t]);
 
   const requestBranch = useCallback(
-    async (request: WorkbenchBranchRequest): Promise<boolean> => {
+    async (request: WorkbenchBranchRequest, activate = false): Promise<boolean> => {
       if (!sessionId || !ownerAttached || branchBusy || replaying || branchInFlight.current)
         return false;
+      const state = useWorkbenchStore.getState();
+      const browse = () => {
+        if (request.op !== 'switch' || !state.branch) return false;
+        const selected = checkoutBranch(state, request).branch;
+        useWorkbenchStore.setState({
+          branchPreview: selected?.current === state.branch.current ? null : request,
+        });
+        return true;
+      };
+      if (request.op === 'switch' && !activate && (live || state.branchPreview)) return browse();
       const atTurn = conversationTurn.current;
       const stillHere = () => conversationTurn.current === atTurn;
       branchInFlight.current = true;
@@ -1072,20 +1087,25 @@ export function WorkbenchChat({
         const receipt = await changeWorkbenchBranch(sessionId, request, {
           pendingSend,
           stillHere,
-          onStopping: () => toast.info(t('workbench.chat.branchStopping')),
         });
         if (!stillHere() || receipt?.status !== 'applied') return false;
+        useWorkbenchStore.setState({ branchPreview: null });
         if (request.op === 'switch') navigation?.followBranchCourse?.(receipt.checkedOut);
         return true;
       } catch (err) {
         if (!stillHere()) return false;
         const code = err instanceof WorkbenchApiError ? err.errorCode : undefined;
+        if (
+          (code === 'SESSION_BUSY' || code === 'MEDIA_PENDING' || code === 'QUESTION_PENDING') &&
+          request.op === 'switch' &&
+          !activate
+        )
+          return browse();
         if (code === 'BRANCH_QUEUED') toast.info(t('workbench.chat.branchQueued'));
         else if (code === 'MEDIA_PENDING') toast.warning(t('workbench.chat.branchMediaPending'));
         else if (code === 'QUESTION_PENDING') toast.info(t('workbench.chat.branchQuestionPending'));
         else if (code === 'MESSAGE_PENDING') toast.info(t('workbench.chat.branchMessagePending'));
         else if (code === 'SESSION_BUSY') toast.error(t('workbench.chat.branchBusy'));
-        else if (code === 'STOP_TIMEOUT') toast.error(t('workbench.chat.branchStopTimeout'));
         else if (code === 'COURSE_SAVE_FAILED') toast.error(t('workbench.chat.branchSaveFailed'));
         else toast.error(t('workbench.chat.branchFailed'));
         return false;
@@ -1097,12 +1117,13 @@ export function WorkbenchChat({
         }
       }
     },
-    [branchBusy, navigation, openStage, ownerAttached, pendingSend, replaying, sessionId, t],
+    [branchBusy, live, navigation, openStage, ownerAttached, pendingSend, replaying, sessionId, t],
   );
   const timelineBranch = useMemo<TimelineBranch>(
     () => ({
       segments: branchView.segments,
       forks: branchView.forks,
+      browsingOnly: live || Boolean(preview),
       disabled: branchBusy || replaying || !ownerAttached,
       // The server retains the original attachments, element and course references.
       onEdit: (userSeq, text) => requestBranch({ op: 'edit', targetSeq: userSeq, text }),
@@ -1111,11 +1132,12 @@ export function WorkbenchChat({
       onSwitchReply: (userSeq, variant) =>
         void requestBranch({ op: 'switch', targetSeq: userSeq, variant }),
     }),
-    [branchView, branchBusy, replaying, ownerAttached, requestBranch],
+    [branchView, branchBusy, replaying, ownerAttached, requestBranch, live, preview],
   );
 
   useDoubleEscapeStop({
-    generating: live && !busy && !pendingStop && !!sessionId && ownerAttached && !covered,
+    generating:
+      live && !preview && !busy && !pendingStop && !!sessionId && ownerAttached && !covered,
     onStop: () => {
       void stop();
     },
@@ -1429,9 +1451,9 @@ export function WorkbenchChat({
                     key={sessionId ?? composerOwnerId}
                     chat={displayedChat}
                     plan={displayedPlan}
-                    turnActive={live}
+                    turnActive={live && !preview}
                     branch={retainedTranscript ? undefined : timelineBranch}
-                    onAnswer={answerQuestion}
+                    onAnswer={preview ? undefined : answerQuestion}
                     dismissedQuestionKey={dismissedQuestionKey}
                     onReviveQuestion={(freeText) => {
                       setFreeTextQuestion(
@@ -1499,7 +1521,33 @@ export function WorkbenchChat({
                 and one surface with one focus beats two that both look live. The
                 transcript keeps its own row for the same question, and both read
                 the same folded node. */}
-            {takeover ? (
+            {preview ? (
+              <div
+                className="flex flex-wrap items-center justify-center gap-3 rounded-xl border bg-background px-4 py-3 text-sm"
+                data-testid="branch-preview-actions"
+              >
+                <span role="status">
+                  {t(live ? 'workbench.chat.branchBackground' : 'workbench.chat.branchPreview')}
+                </span>
+                <button
+                  type="button"
+                  className="underline"
+                  onClick={() => useWorkbenchStore.setState({ branchPreview: null })}
+                >
+                  {t('workbench.chat.branchReturn')}
+                </button>
+                {!live && (
+                  <button
+                    type="button"
+                    disabled={branchBusy}
+                    className="underline"
+                    onClick={() => void requestBranch(preview, true)}
+                  >
+                    {t('workbench.chat.branchContinue')}
+                  </button>
+                )}
+              </div>
+            ) : takeover ? (
               <QuestionForm
                 node={takeover}
                 onAnswer={answerQuestion}

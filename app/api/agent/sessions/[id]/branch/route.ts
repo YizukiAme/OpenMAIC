@@ -26,7 +26,13 @@ import {
   type UserMessageBody,
 } from '@/lib/server/agent-runtime/user-message-input';
 import { apiError, type ApiErrorCode } from '@/lib/server/api-response';
-import { parseBranchRequest } from '@/lib/server/course-versions/tree';
+import { readCourseVersion } from '@/lib/server/course-versions/store';
+import {
+  courseVersionsOnPath,
+  lastVersionBoundary,
+  planBranchMove,
+  parseBranchRequest,
+} from '@/lib/server/course-versions/tree';
 import { withRequestOwner } from '@/lib/server/identity/with-owner';
 import { assertWorkspaceModelsAuthorized } from '@/lib/server/model-config/runtime';
 
@@ -204,5 +210,40 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       if (claimed) return claimed;
       throw error;
     }
+  });
+}
+
+/** Browsing a saved version leaves the worker's cursor and live documents alone. */
+export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  if (!isAgentRuntimeConfigured()) return new Response('Not found', { status: 404 });
+  return withRequestOwner(req, async ({ ownerId }, headers) => {
+    const { id } = await params;
+    const store = await getAgentSessionStore();
+    const meta = await store.getSession(id);
+    if (!meta || meta.ownerId !== ownerId || isPBLRoleSession(id))
+      return new Response('Not found', { status: 404, headers });
+    const query = req.nextUrl.searchParams;
+    const variant = query.get('variant');
+    const request = parseBranchRequest({
+      op: 'switch',
+      targetSeq: query.has('targetSeq') ? Number(query.get('targetSeq')) : undefined,
+      variant: variant === null ? undefined : variant === 'orig' ? variant : Number(variant),
+    });
+    if (!request) return new Response('Invalid version', { status: 400, headers });
+    const tree = await store.openEntryTree(id, 'branch-preview', meta.attempt);
+    const move = planBranchMove(await tree.getEntries(), request, 0);
+    if (move.kind !== 'move') return new Response('Not found', { status: 404, headers });
+    const path = await tree.getPathToRoot(move.leafId);
+    const versions = courseVersionsOnPath(path);
+    if (!versions.size || lastVersionBoundary(path)?.unavailable)
+      return NextResponse.json(null, { headers });
+    const { pool } = await getServerPersistenceProvider(process.env.DATABASE_URL ?? '');
+    const preview = await readCourseVersion(
+      pool,
+      ownerId,
+      [...versions.values()],
+      query.get('course'),
+    );
+    return NextResponse.json(preview, { headers });
   });
 }

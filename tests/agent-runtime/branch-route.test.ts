@@ -44,7 +44,7 @@ vi.mock('@/lib/server/agent-runtime/pending-media', () => ({
   listPendingMediaTasks: mocks.listPendingMediaTasks,
 }));
 
-import { POST } from '@/app/api/agent/sessions/[id]/branch/route';
+import { GET, POST } from '@/app/api/agent/sessions/[id]/branch/route';
 
 function call(body: unknown) {
   const request = new NextRequest('http://localhost/api/agent/sessions/session-1/branch', {
@@ -149,4 +149,20 @@ describe('POST agent session branch (#1317 prototype)', () => {
     });
     expect((await call({ op: 'regenerate', targetSeq: 7 })).status).toBe(404);
   });
+});
+
+it('keeps another owner’s saved version private', async () => {
+  mocks.getSession.mockResolvedValue({
+    id: 'session-1',
+    ownerId: 'other-owner',
+    status: 'running',
+  });
+  const response = await GET(
+    new NextRequest('http://localhost/api/agent/sessions/session-1/branch?targetSeq=0'),
+    {
+      params: Promise.resolve({ id: 'session-1' }),
+    },
+  );
+  expect(response.status).toBe(404);
+  expect(mocks.query).not.toHaveBeenCalled();
 });

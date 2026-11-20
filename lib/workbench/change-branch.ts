@@ -4,8 +4,6 @@ import type { BranchReceipt } from './branch-fold';
 import { samePanes, withCourse, type WorkspacePanes } from './workspace-panes';
 import {
   branchWorkbenchSession,
-  cancelWorkbenchSession,
-  recoverTerminalCancelStatus,
   useWorkbenchStore,
   WorkbenchApiError,
   type ChatNode,
@@ -58,39 +56,16 @@ export async function changeWorkbenchBranch(
   {
     pendingSend = false,
     stillHere = () => true,
-    onStopping,
   }: {
     pendingSend?: boolean;
     stillHere?: () => boolean;
-    onStopping?: () => void;
   } = {},
 ): Promise<BranchReceipt | null> {
   const current = () => stillHere() && useWorkbenchStore.getState().sessionId === sessionId;
   if (!current()) return null;
   if (pendingSend || isRunLive(useWorkbenchStore.getState().status)) {
-    onStopping?.();
-    // The terminal frame can precede the database commit. A queued send can
-    // also still look terminal locally. Check the row the branch route admits.
-    const stopSignal = AbortSignal.timeout(WAIT_MS);
-    try {
-      await cancelWorkbenchSession(sessionId, stopSignal);
-      while (current()) {
-        const response = await fetch(`/api/agent/sessions/${encodeURIComponent(sessionId)}`, {
-          cache: 'no-store',
-          signal: stopSignal,
-        });
-        if (!response.ok) throw new Error('Could not read session status');
-        const { status } = await response.json();
-        if (status === 'cancelled' || status === 'succeeded' || status === 'failed') break;
-        await new Promise((resolve) => setTimeout(resolve, 500));
-      }
-    } catch (error) {
-      if (stopSignal.aborted)
-        throw new WorkbenchApiError('Stopping timed out', 408, 'STOP_TIMEOUT');
-      if (!recoverTerminalCancelStatus(sessionId, error)) throw error;
-    }
+    throw new WorkbenchApiError('A reply is still generating', 409, 'SESSION_BUSY');
   }
-  if (!current()) return null;
   // Preserve a title, page or outline still in the editor's autosave debounce.
   try {
     await flushStageSave();
