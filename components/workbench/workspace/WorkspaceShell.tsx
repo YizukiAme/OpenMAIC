@@ -137,7 +137,11 @@ import {
   rememberWorkspaceSession,
   validateRememberedWorkspaceSession,
 } from '@/lib/workbench/workspace-session-memory';
-import type { WorkbenchCourseSummary } from '@/lib/workbench/panel-context';
+import type {
+  WorkbenchCourseNavigation,
+  WorkbenchCourseSummary,
+} from '@/lib/workbench/panel-context';
+import { panesAfterBranchSwitch } from '@/lib/workbench/change-branch';
 import { useWorkbenchStore, type WorkbenchMaterial } from '@/lib/workbench/session-store';
 import { renameWorkbenchSession } from '@/lib/workbench/session-store';
 import { commitSessionRename, createSessionRenameQueue } from '@/lib/workbench/session-title';
@@ -1235,7 +1239,9 @@ function WorkspaceShellController({ initialPanes }: { readonly initialPanes: Wor
   const libraryRevision = useWorkbenchStore((s) => s.libraryRevision);
   // Course links in first-seen order — each stage opens at most once per session.
   const stageLinkStageIds = useWorkbenchStore((s) => s.stageLinkStageIds);
-  const attachedSessionReplaying = useWorkbenchStore((s) => s.replaying);
+  const historicalCourseActivity = useWorkbenchStore(
+    (s) => s.replaying || s.branch?.viewingHistory === true,
+  );
   const replayedStageLinkCount = useWorkbenchStore((s) => s.replayedStageLinkCount);
   // Serialize only provenance ids: streaming text changes must not restart the
   // scene reads. This is a derived value, not another lifecycle/store.
@@ -1322,7 +1328,11 @@ function WorkspaceShellController({ initialPanes }: { readonly initialPanes: Wor
       : null;
 
   const previewEligible =
-    !render.view && !narrow && makingCourse && panes.sessionId === attachedSessionId;
+    !historicalCourseActivity &&
+    !render.view &&
+    !narrow &&
+    makingCourse &&
+    panes.sessionId === attachedSessionId;
   const [reportedPreviewTab, setPreviewTab] = useState<PreviewTabState>(NO_PREVIEW_TAB);
   // The preview reports a render behind; a report from the previous
   // conversation (whose request keys may repeat here) is no report.
@@ -1400,7 +1410,7 @@ function WorkspaceShellController({ initialPanes }: { readonly initialPanes: Wor
    */
   const coursesToOpenKey = coursesToOpen.join('|');
   useEffect(() => {
-    if (attachedSessionReplaying) return;
+    if (historicalCourseActivity) return;
     if (!attachedSessionId || attachedSessionId !== panes.sessionId) return;
     if (courseToShow) {
       const next = openCourseTab(courseTabs, courseToShow);
@@ -1427,7 +1437,7 @@ function WorkspaceShellController({ initialPanes }: { readonly initialPanes: Wor
     navigateInBackground((current) => withCourse(current, ids[0]), 'push');
   }, [
     attachedSessionId,
-    attachedSessionReplaying,
+    historicalCourseActivity,
     collapse,
     courseTabs,
     courseToShow,
@@ -1470,13 +1480,13 @@ function WorkspaceShellController({ initialPanes }: { readonly initialPanes: Wor
         courses.state === 'ready' ? courses.classrooms.map((course) => course.id) : [],
       openCourseIds: courseTabs.courseIds,
       closedCourseIds: courseTabs.closedCourseIds ?? [],
-      replaying: attachedSessionReplaying,
+      replaying: historicalCourseActivity,
     });
     // eslint-disable-next-line react-hooks/set-state-in-effect -- live stage links are an external stream reconciled into the tab set
     if (open.length > 0) openCourses(open);
   }, [
     attachedSessionId,
-    attachedSessionReplaying,
+    historicalCourseActivity,
     createdThisRequest,
     courseTabs,
     courses.classrooms,
@@ -1874,15 +1884,21 @@ function WorkspaceShellController({ initialPanes }: { readonly initialPanes: Wor
     [activateCourseFromStrip, closeCourseFromStrip, courseTabItems],
   );
 
-  const courseNavigation = useMemo(
+  const courseNavigation = useMemo<WorkbenchCourseNavigation>(
     () => ({
       openCourse,
+      followBranchCourse: (checkedOut) =>
+        navigateInBackground(
+          (current) =>
+            panesAfterBranchSwitch(panes, current, useWorkbenchStore.getState().chat, checkedOut),
+          'replace',
+        ),
       activeCourseId: panes.courseId,
       lookupCourse,
       courseOptions,
       generatingCourseIds,
     }),
-    [courseOptions, generatingCourseIds, lookupCourse, openCourse, panes.courseId],
+    [courseOptions, generatingCourseIds, lookupCourse, navigateInBackground, openCourse, panes],
   );
 
   // The preview of the first request the home composer started on this page

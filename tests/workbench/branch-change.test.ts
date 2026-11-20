@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { changeWorkbenchBranch, courseForSwitch } from '@/lib/workbench/change-branch';
+import { changeWorkbenchBranch, panesAfterBranchSwitch } from '@/lib/workbench/change-branch';
 import { useWorkbenchStore, type WorkbenchEvent } from '@/lib/workbench/session-store';
 import { flushStageSave } from '@/lib/store/stage';
 
@@ -93,18 +93,32 @@ describe('changing the selected branch', () => {
     await expect(change).resolves.toBeNull();
     expect(fetch).toHaveBeenCalledTimes(1);
   });
+});
 
-  it('opens the selected reply’s course even if the outgoing reply created a different one', () => {
-    expect(
-      courseForSwitch(
-        [{ kind: 'course', key: 'e17', text: '', stageIds: ['wanted', 'deleted'] }],
-        [
-          { stageId: 'older', outcome: 'restored' },
-          { stageId: 'wanted', outcome: 'unchanged' },
-          { stageId: 'deleted', outcome: 'missing' },
-        ],
-        'outgoing',
-      ),
-    ).toBe('wanted');
+describe('following a branch in the open classroom', () => {
+  const open = { sessionId: 'session', courseId: 'outgoing' };
+  const closed = { ...open, courseId: null };
+  const chat = [{ kind: 'course' as const, key: 'e17', text: '', stageIds: ['wanted', 'deleted'] }];
+  const checkedOut = [
+    { stageId: 'older', outcome: 'restored' },
+    { stageId: 'wanted', outcome: 'unchanged' },
+    { stageId: 'deleted', outcome: 'missing' },
+  ];
+
+  it('shows the selected reply’s course in an already open pane', () => {
+    expect(panesAfterBranchSwitch(open, open, chat, checkedOut)).toEqual({
+      ...open,
+      courseId: 'wanted',
+    });
+  });
+
+  it('leaves a chat-only workspace alone', () => {
+    expect(panesAfterBranchSwitch(closed, closed, chat, checkedOut)).toBeNull();
+  });
+
+  it('respects navigation while the checkout is pending', () => {
+    for (const current of [closed, { ...open, courseId: 'other' }, { ...open, view: 'library' }]) {
+      expect(panesAfterBranchSwitch(open, current, chat, checkedOut)).toBeNull();
+    }
   });
 });

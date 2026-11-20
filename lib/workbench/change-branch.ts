@@ -1,6 +1,7 @@
 import { isRunLive } from '@/components/workbench/chat/composer-send-state';
 import { flushStageSave } from '@/lib/store/stage';
 import type { BranchReceipt } from './branch-fold';
+import { samePanes, withCourse, type WorkspacePanes } from './workspace-panes';
 import {
   branchWorkbenchSession,
   cancelWorkbenchSession,
@@ -13,12 +14,14 @@ import {
 
 const WAIT_MS = 30_000;
 
-/** The reply's own course card wins over an older course also present on its path. */
-export function courseForSwitch(
+/** Follow the reply in an open classroom if the user stayed there during checkout. */
+export function panesAfterBranchSwitch(
+  started: WorkspacePanes,
+  current: WorkspacePanes,
   chat: readonly ChatNode[],
   checkedOut: BranchReceipt['checkedOut'],
-  activeCourse: string | null,
-): string | undefined {
+): WorkspacePanes | null {
+  if (!current.courseId || !samePanes(started, current)) return null;
   const available =
     checkedOut?.filter((course) => course.outcome !== 'missing').map((course) => course.stageId) ??
     [];
@@ -26,7 +29,8 @@ export function courseForSwitch(
     (node) => node.kind === 'course' && node.stageIds?.some((id) => available.includes(id)),
   );
   const choices = card?.stageIds?.filter((id) => available.includes(id)) ?? available;
-  return activeCourse && choices.includes(activeCourse) ? activeCourse : choices[0];
+  if (!choices.length || choices.includes(current.courseId)) return null;
+  return withCourse(current, choices[0]);
 }
 
 /** POST acknowledges queuing. Only the worker's lifecycle receipt confirms a checkout. */

@@ -5,6 +5,7 @@
  *
  */
 import { createContext, useContext, useMemo, type ReactNode } from 'react';
+import type { BranchReceipt } from './branch-fold';
 import type { WorkbenchMaterial } from './session-store';
 import type { ElementRef } from './element-refs';
 import type { CourseRef } from './course-refs';
@@ -93,6 +94,8 @@ export interface WorkbenchCourseOption {
  */
 export interface WorkbenchCourseNavigation {
   readonly openCourse: (courseId: string) => void;
+  /** Let an open course tab follow a checkout without expanding the classroom. */
+  readonly followBranchCourse?: (checkedOut: BranchReceipt['checkedOut']) => void;
   /** The one on screen; `null` when the right pane holds nothing. */
   readonly activeCourseId: string | null;
   /** `null` for an id the workspace cannot name — the link then degrades. */

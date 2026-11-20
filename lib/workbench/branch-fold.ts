@@ -46,6 +46,8 @@ export function branchReceipts(data: unknown): BranchReceipt[] {
 export interface BranchState {
   segments: Readonly<Record<string, BranchSegment>>;
   current: string;
+  /** Course activity on a selected historical branch has already happened. */
+  viewingHistory: boolean;
   /** Rows of branches already visited, saved only when moving away. */
   saved: Readonly<Record<string, ChatNode[]>>;
   /** Branch requests and user messages received before the worker finishes checkout. */
@@ -65,6 +67,7 @@ export function initialBranchState(): BranchState {
       },
     },
     current: ROOT_SEGMENT,
+    viewingHistory: false,
     saved: {},
     inbox: [],
   };
@@ -142,7 +145,7 @@ export function checkoutBranch(fold: WorkbenchFold, request: WorkbenchEvent): Wo
     pages: progress?.pages ?? {},
     courseTitle: progress?.courseTitle ?? null,
     chat: path.flatMap((segment) => saved[segment.id] ?? []),
-    branch: { ...branch, current: path.at(-1)!.id },
+    branch: { ...branch, current: path.at(-1)!.id, viewingHistory: op === 'switch' },
     runCourseStageIds: [],
     thinkingKey: null,
     assistantKey: null,
@@ -174,6 +177,7 @@ function startSegment(
   const segment: BranchSegment = { id, kind, parent, children: [], selected: null, ...extra };
   const withSegment: BranchState = {
     ...state,
+    viewingHistory: false,
     segments: { ...state.segments, [id]: segment },
     current: id,
   };

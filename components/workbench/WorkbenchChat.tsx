@@ -74,7 +74,7 @@ import {
   type WorkbenchMaterial,
 } from '@/lib/workbench/session-store';
 import { initialBranchState, projectBranchChat } from '@/lib/workbench/branch-fold';
-import { changeWorkbenchBranch, courseForSwitch } from '@/lib/workbench/change-branch';
+import { changeWorkbenchBranch } from '@/lib/workbench/change-branch';
 import { flushStageSave, useStageStore } from '@/lib/store/stage';
 import {
   AtSignButton,
@@ -1075,14 +1075,7 @@ export function WorkbenchChat({
           onStopping: () => toast.info(t('workbench.chat.branchStopping')),
         });
         if (!stillHere() || receipt?.status !== 'applied') return false;
-        if (request.op === 'switch' && navigation) {
-          const course = courseForSwitch(
-            useWorkbenchStore.getState().chat,
-            receipt.checkedOut,
-            navigation.activeCourseId,
-          );
-          if (course && course !== navigation.activeCourseId) navigation.openCourse(course);
-        }
+        if (request.op === 'switch') navigation?.followBranchCourse?.(receipt.checkedOut);
         return true;
       } catch (err) {
         if (!stillHere()) return false;

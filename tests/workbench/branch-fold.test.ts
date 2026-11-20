@@ -144,10 +144,12 @@ describe('branch fold', () => {
     state = [pick, applied(pick)].reduce(foldEvent, state);
     expect(onScreen(state).at(-1)).toBe('added a video');
     expect(forkOf(state, 'added a video')).toBe('1/2');
+    expect(state.branch?.viewingHistory).toBe(true);
 
     // A message sent now continues the branch on screen.
     state = foldEvent(state, ev('user_message', { text: 'make it shorter', delivery: 'queued' }));
     expect(onScreen(state).slice(-2)).toEqual(['added a video', '> make it shorter']);
+    expect(state.branch?.viewingHistory).toBe(false);
   });
 
   it('puts an edited message beside the original with its own reply', () => {
